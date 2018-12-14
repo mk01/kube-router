@@ -18,14 +18,14 @@ func Test_GetPodCidrFromCniSpec(t *testing.T) {
 	testcases := []struct {
 		name        string
 		cniConfFile string
-		podCidr     net.IPNet
+		podCidr     *net.IPNet
 		err         error
 		filename    string
 	}{
 		{
 			"CNI config file has subnet",
 			`{"bridge":"kube-bridge","ipam":{"subnet":"172.17.0.0/24","type":"host-local"},"isDefaultGateway":true,"name":"kubernetes","type":"bridge"}`,
-			net.IPNet{
+			&net.IPNet{
 				IP:   net.IPv4(172, 17, 0, 0),
 				Mask: net.IPv4Mask(255, 255, 255, 0),
 			},
@@ -35,7 +35,7 @@ func Test_GetPodCidrFromCniSpec(t *testing.T) {
 		{
 			"CNI config file missing subnet",
 			`{"bridge":"kube-bridge","ipam":{"type":"host-local"},"isDefaultGateway":true,"name":"kubernetes","type":"bridge"}`,
-			net.IPNet{},
+			&net.IPNet{},
 			nil,
 			"10-kuberouter.conf",
 		},
@@ -169,7 +169,7 @@ func Test_GetPodCidrFromNodeSpec(t *testing.T) {
 					},
 				},
 			},
-			"",
+			"<nil>",
 			errors.New("error parsing pod CIDR in node annotation: invalid CIDR address: 172.17.0.0"),
 		},
 	}
@@ -189,7 +189,7 @@ func Test_GetPodCidrFromNodeSpec(t *testing.T) {
 				t.Error("did not get expected error")
 			}
 
-			if podCIDR != testcase.podCIDR {
+			if podCIDR.String() != testcase.podCIDR {
 				t.Logf("actual podCIDR: %q", podCIDR)
 				t.Logf("expected podCIDR: %q", testcase.podCIDR)
 				t.Error("did not get expected podCIDR")

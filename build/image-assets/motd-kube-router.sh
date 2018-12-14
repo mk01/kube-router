@@ -1,5 +1,12 @@
 #!/usr/bin/env sh
 
+function ribInfo() {
+    OUT=$(gobgp global rib -a $1 | grep -v "not in table")
+    test -n "${OUT}" || return 0
+    echo "--- BGP Route Info ($1) ---"
+    echo "${OUT}"
+}
+
 echo "Welcome to kube-router on \"${NODE_NAME}\"!"
 echo
 echo "For debugging, the following tools are available:"
@@ -32,8 +39,8 @@ echo
 echo "--- BGP Neighbors ---"
 gobgp neighbor
 echo
-echo "--- BGP Route Info ---"
-gobgp global rib
+ribInfo ipv4
+ribInfo ipv6
 echo
 echo "--- IPVS Services ---"
 ipvsadm -ln

@@ -1,11 +1,14 @@
-package utils
+package netutils
 
 import (
 	"bytes"
 	"errors"
 	"fmt"
+	"net"
 	"os/exec"
 	"strings"
+
+	"github.com/cloudnativelabs/kube-router/pkg/utils"
 )
 
 var (
@@ -79,18 +82,28 @@ const (
 	OptionForceAdd = "forceadd"
 )
 
+var protoRelatedOptions = []string{OptionFamilly, FamillyInet6, FamillyInet}
+
+var perProtocolNamePrefix = map[Proto]string{
+	V4: "v4:",
+	V6: "v6:",
+}
+
 // IPSet represent ipset sets managed by.
 type IPSet struct {
 	ipSetPath *string
 	Sets      map[string]*Set
-	isIpv6    bool
 }
+
+type entryListType []*Entry
+type perProtoEntryMapType map[Proto]entryListType
 
 // Set reprensent a ipset set entry.
 type Set struct {
 	Parent  *IPSet
 	Name    string
-	Entries []*Entry
+	lock    *utils.ChannelLockType
+	Entries perProtoEntryMapType
 	Options []string
 }
 
@@ -111,20 +124,7 @@ func getIPSetPath() (*string, error) {
 
 // Used to run ipset binary with args and return stdout.
 func (ipset *IPSet) run(args ...string) (string, error) {
-	var stderr bytes.Buffer
-	var stdout bytes.Buffer
-	cmd := exec.Cmd{
-		Path:   *ipset.ipSetPath,
-		Args:   append([]string{*ipset.ipSetPath}, args...),
-		Stderr: &stderr,
-		Stdout: &stdout,
-	}
-
-	if err := cmd.Run(); err != nil {
-		return "", errors.New(stderr.String())
-	}
-
-	return stdout.String(), nil
+	return ipset.runWithStdin(nil, args...)
 }
 
 // Used to run ipset binary with arg and inject stdin buffer and return stdout.
@@ -136,7 +136,10 @@ func (ipset *IPSet) runWithStdin(stdin *bytes.Buffer, args ...string) (string, e
 		Args:   append([]string{*ipset.ipSetPath}, args...),
 		Stderr: &stderr,
 		Stdout: &stdout,
-		Stdin:  stdin,
+	}
+
+	if stdin != nil {
+		cmd.Stdin = stdin
 	}
 
 	if err := cmd.Run(); err != nil {
@@ -147,7 +150,7 @@ func (ipset *IPSet) runWithStdin(stdin *bytes.Buffer, args ...string) (string, e
 }
 
 // NewIPSet create a new IPSet with ipSetPath initialized.
-func NewIPSet(isIpv6 bool) (*IPSet, error) {
+func NewIPSet() (*IPSet, error) {
 	ipSetPath, err := getIPSetPath()
 	if err != nil {
 		return nil, err
@@ -155,7 +158,6 @@ func NewIPSet(isIpv6 bool) (*IPSet, error) {
 	ipSet := &IPSet{
 		ipSetPath: ipSetPath,
 		Sets:      make(map[string]*Set),
-		isIpv6:    isIpv6,
 	}
 	return ipSet, nil
 }
@@ -174,30 +176,13 @@ func (ipset *IPSet) Create(setName string, createOptions ...string) (*Set, error
 	}
 
 	// Determine if set with the same name is already active on the system
-	setIsActive, err := ipset.Sets[setName].IsActive()
-	if err != nil {
-		return nil, fmt.Errorf("Failed to determine if ipset set %s exists: %s",
+	if err := ipset.Sets[setName].Create(); err != nil {
+		return nil, fmt.Errorf("Failed to create ipset set %s: %s",
 			setName, err)
 	}
+	ipset.Sets[setName].initLock()
 
-	// Create set if missing from the system
-	if !setIsActive {
-		if ipset.isIpv6 {
-			// Add "family inet6" option and a "inet6:" prefix for IPv6 sets.
-			args := []string{"create", "-exist", ipset.Sets[setName].name()}
-			args = append(args, createOptions...)
-			args = append(args, "family", "inet6")
-			if _, err := ipset.run(args...); err != nil {
-				return nil, fmt.Errorf("Failed to create ipset set on system: %s", err)
-			}
-		} else {
-			_, err := ipset.run(append([]string{"create", "-exist", setName},
-				createOptions...)...)
-			if err != nil {
-				return nil, fmt.Errorf("Failed to create ipset set on system: %s", err)
-			}
-		}
-	}
+	ipset.Sets[setName].Entries = make(perProtoEntryMapType)
 	return ipset.Sets[setName], nil
 }
 
@@ -208,13 +193,35 @@ func (ipset *IPSet) Add(set *Set) error {
 		return err
 	}
 
-	for _, entry := range set.Entries {
-		_, err := ipset.Get(set.Name).Add(entry.Options...)
-		if err != nil {
+	return ipset.Get(set.Name).CopyEntriesFrom(set)
+}
+
+func (set *Set) create(p Proto, options ...string) error {
+	_, err := set.Parent.run(append([]string{"create", set.name(p)}, fixOptions(p, options)...)...)
+	if err != nil {
+		return fmt.Errorf("Failed to create ipset set on system: %s", err)
+	}
+	return nil
+}
+
+func (set *Set) initLock() {
+	if set.lock == nil {
+		lock := make(utils.ChannelLockType, 1)
+		set.lock = &lock
+	}
+}
+
+func (set *Set) CopyEntriesFrom(setFrom *Set) error {
+	return set.perProtoMethodWrapper(set._copyEntriesFrom, setFrom)
+}
+
+func (set *Set) _copyEntriesFrom(p Proto, args ...interface{}) error {
+	setFrom := args[0].(*Set)
+	for _, entry := range setFrom.Entries[p] {
+		if _, err := set.Parent.Get(set.Name).Add(entry.Options...); err != nil {
 			return err
 		}
 	}
-
 	return nil
 }
 
@@ -225,18 +232,27 @@ func (set *Set) Add(addOptions ...string) (*Entry, error) {
 		Set:     set,
 		Options: addOptions,
 	}
-	set.Entries = append(set.Entries, entry)
-	_, err := set.Parent.run(append([]string{"add", "-exist", entry.Set.name()}, addOptions...)...)
+	proto := entry.getProtocol()
+	set.Entries[proto] = append(set.Entries[proto], entry)
+	_, err := set.Parent.run(append([]string{"add", "-exist", entry.Set.name(proto)}, addOptions...)...)
 	if err != nil {
 		return nil, err
 	}
 	return entry, nil
 }
 
+func entryRecordsSplitter(r rune) bool {
+	return r == '-' || r == ','
+}
+
+func (entry *Entry) getProtocol() Proto {
+	return Proto(NewIP(strings.FieldsFunc(entry.Options[0], entryRecordsSplitter)[0]).Protocol())
+}
+
 // Del an entry from a set. If the -exist option is specified and the entry is
 // not in the set (maybe already expired), then the command is ignored.
 func (entry *Entry) Del() error {
-	_, err := entry.Set.Parent.run(append([]string{"del", entry.Set.name()}, entry.Options...)...)
+	_, err := entry.Set.Parent.run(append([]string{"del", entry.Set.name(entry.getProtocol())}, entry.Options...)...)
 	if err != nil {
 		return err
 	}
@@ -247,7 +263,7 @@ func (entry *Entry) Del() error {
 // Test wether an entry is in a set or not. Exit status number is zero if the
 // tested entry is in the set and nonzero if it is missing from the set.
 func (set *Set) Test(testOptions ...string) (bool, error) {
-	_, err := set.Parent.run(append([]string{"test", set.name()}, testOptions...)...)
+	_, err := set.Parent.run(append([]string{"test", set.name((&Entry{Options: testOptions}).getProtocol())}, testOptions...)...)
 	if err != nil {
 		return false, err
 	}
@@ -257,11 +273,13 @@ func (set *Set) Test(testOptions ...string) (bool, error) {
 // Destroy the specified set or all the sets if none is given. If the set has
 // got reference(s), nothing is done and no set destroyed.
 func (set *Set) Destroy() error {
-	_, err := set.Parent.run("destroy", set.name())
-	if err != nil {
-		return err
+	_, _ = set.Parent.run("destroy", set.Name)
+	for _, p := range UsedTcpProtocols {
+		_, err := set.Parent.run("destroy", set.name(p))
+		if err != nil && !strings.Contains(err.Error(), "not exist") {
+			return errors.New(fmt.Sprintf("%s - %s", set.name(p), err.Error()))
+		}
 	}
-
 	delete(set.Parent.Sets, set.Name)
 	return nil
 }
@@ -296,23 +314,90 @@ func (ipset *IPSet) DestroyAllWithin() error {
 }
 
 // IsActive checks if a set exists on the system with the same name.
-func (set *Set) IsActive() (bool, error) {
-	_, err := set.Parent.run("list", set.name())
-	if err != nil {
-		if strings.Contains(err.Error(), "name does not exist") {
-			return false, nil
-		}
+func (set *Set) IsActive(p Proto) (exists bool, err error) {
+	if _, err = set.Parent.run("list", set.name(p)); err != nil &&
+		!strings.Contains(err.Error(), "name does not exist") {
 		return false, err
 	}
-	return true, nil
+	return err == nil, nil
 }
 
-func (set *Set) name() string {
-	if set.Parent.isIpv6 {
-		return "inet6:" + set.Name
-	} else {
-		return set.Name
+func (set *Set) Create() error {
+	for _, p := range UsedTcpProtocols {
+		if is, err := set.createForProto(p, true); !is || err != nil {
+			return err
+		}
 	}
+	return set.createUnionSet()
+}
+
+// IsActive checks if a set exists on the system with the same name.
+func (set *Set) createForProto(p Proto, args ...bool) (exists bool, err error) {
+	var create = len(args) > 0 && args[0] == true
+
+	if exists, err = set.IsActive(p); !exists && create {
+		err = set.create(p, set.Options...)
+	}
+	if err == nil {
+		exists = true
+	}
+	return exists, err
+}
+
+func (set *Set) createUnionSet() (err error) {
+	var out string
+	var create bool
+
+	if out, err = set.Parent.run("list", set.Name); err != nil &&
+		!strings.Contains(err.Error(), "name does not exist") {
+		return err
+	} else if err != nil {
+		create = true
+	} else if err == nil && !strings.Contains(out, "Type: list:set") {
+		create = true
+		IptablesCleanRule(V4, set.Name, true)
+		if _, err = set.Parent.run("destroy", set.Name); err != nil {
+			return fmt.Errorf("Incompatible ipset type found for \"%s\" and set can't by recreated - manual cleanup needed.", set.Name)
+		}
+	}
+	if create {
+		_, err = set.Parent.run("create", set.Name, "list:set")
+	}
+	if err == nil {
+		_, err = set.Parent.run("add", "-exist", set.Name, set.name(V4))
+	}
+	if err == nil {
+		_, err = set.Parent.run("add", "-exist", set.Name, set.name(V6))
+	}
+	return err
+}
+
+func getSystemName(p Proto, name string) string {
+	return perProtocolNamePrefix[p] + name
+}
+
+func (set *Set) name(p Proto) string {
+	return getSystemName(p, set.Name)
+}
+
+func removeFamily(options []string) []string {
+	newOptions := make([]string, 0)
+	for _, o := range options {
+		if utils.CheckForElementInArray(o, protoRelatedOptions) {
+			continue
+		}
+		newOptions = append(newOptions, o)
+	}
+	return newOptions
+}
+
+func fixOptions(p Proto, options []string) []string {
+	newOptions := removeFamily(options)
+	newOptions = append(newOptions, OptionFamilly)
+	if p == V6 {
+		return append(newOptions, FamillyInet6)
+	}
+	return append(newOptions, FamillyInet)
 }
 
 // Parse ipset save stdout.
@@ -325,15 +410,24 @@ func parseIPSetSave(ipset *IPSet, result string) map[string]*Set {
 	lines := strings.Split(result, "\n")
 	for _, line := range lines {
 		content := strings.Split(line, " ")
-		if content[0] == "create" {
-			sets[content[1]] = &Set{
+		if len(content) < 2 {
+			continue
+		}
+		name, proto := getNameAndProto(content[1])
+		if name == "" {
+			continue
+		}
+		if content[0] == "create" && sets[name] == nil {
+			sets[name] = &Set{
 				Parent:  ipset,
-				Name:    content[1],
-				Options: content[2:],
+				Name:    name,
+				Options: removeFamily(content[2:]),
 			}
+			sets[name].Entries = make(perProtoEntryMapType)
+			sets[name].initLock()
 		} else if content[0] == "add" {
-			set := sets[content[1]]
-			set.Entries = append(set.Entries, &Entry{
+			set := sets[name]
+			set.Entries[proto] = append(set.Entries[proto], &Entry{
 				Set:     set,
 				Options: content[2:],
 			})
@@ -343,19 +437,42 @@ func parseIPSetSave(ipset *IPSet, result string) map[string]*Set {
 	return sets
 }
 
+func getNameAndProto(s string) (string, Proto) {
+	set := strings.Split(s, ":")
+	if len(set) < 2 {
+		return "", V4
+	}
+	if set[0] == "v4" {
+		return set[1], V4
+	}
+	return set[1], V6
+}
+
 // Build ipset restore input
 // ex:
 // create KUBE-DST-3YNVZWWGX3UQQ4VQ hash:ip family inet hashsize 1024 maxelem 65536 timeout 0
 // add KUBE-DST-3YNVZWWGX3UQQ4VQ 100.96.1.6 timeout 0
-func buildIPSetRestore(ipset *IPSet) string {
-	ipSetRestore := ""
-	for _, set := range ipset.Sets {
-		ipSetRestore += fmt.Sprintf("create %s %s\n", set.Name, strings.Join(set.Options[:], " "))
-		for _, entry := range set.Entries {
-			ipSetRestore += fmt.Sprintf("add %s %s\n", set.Name, strings.Join(entry.Options[:], " "))
+func (set *Set) buildIPSetRestore(buf *bytes.Buffer) *bytes.Buffer {
+	fmt.Fprintf(buf, "create %s %s\n", set.name(V4), strings.Join(fixOptions(V4, set.Options)[:], " "))
+	fmt.Fprintf(buf, "create %s %s\n", set.name(V6), strings.Join(fixOptions(V6, set.Options)[:], " "))
+	for _, p := range UsedTcpProtocols {
+		for _, entry := range set.Entries[p] {
+			fmt.Fprintf(buf, "add %s %s\n", set.name(p), strings.Join(entry.Options[:], " "))
 		}
 	}
-	return ipSetRestore
+	return buf
+}
+
+// multi-family wrapper to base Set/IPSet methods.
+// it takes the method as parameter and runs it for both protocol families, with
+// adapted setName (name prefix) or options ( inet/inet6 family opt )
+func (set *Set) perProtoMethodWrapper(f func(Proto, ...interface{}) error, args ...interface{}) (err error) {
+	for _, p := range UsedTcpProtocols {
+		if err = f(p, args...); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Save the given set, or all sets if none is given to stdout in a format that
@@ -377,9 +494,20 @@ func (ipset *IPSet) Save() error {
 // unless specified so in the restore file. All commands are allowed in restore
 // mode except list, help, version, interactive mode and restore itself.
 // Send formated ipset.sets into stdin of "ipset restore" command.
-func (ipset *IPSet) Restore() error {
-	stdin := bytes.NewBufferString(buildIPSetRestore(ipset))
-	_, err := ipset.runWithStdin(stdin, "restore", "-exist")
+func (ipset *IPSet) Restore() (err error) {
+	var buf = &bytes.Buffer{}
+	for _, set := range ipset.Sets {
+		set.buildIPSetRestore(buf)
+	}
+	return ipset._restore(buf)
+}
+
+func (set *Set) Restore() error {
+	return set.Parent._restore(set.buildIPSetRestore(&bytes.Buffer{}))
+}
+
+func (ipset *IPSet) _restore(buf *bytes.Buffer) error {
+	_, err := ipset.runWithStdin(buf, "restore", "-exist")
 	if err != nil {
 		return err
 	}
@@ -388,7 +516,11 @@ func (ipset *IPSet) Restore() error {
 
 // Flush all entries from the specified set or flush all sets if none is given.
 func (set *Set) Flush() error {
-	_, err := set.Parent.run("flush", set.Name)
+	return set.perProtoMethodWrapper(set._flush)
+}
+
+func (set *Set) _flush(p Proto, args ...interface{}) error {
+	_, err := set.Parent.run("flush", set.name(p))
 	if err != nil {
 		return err
 	}
@@ -397,9 +529,10 @@ func (set *Set) Flush() error {
 
 // Flush all entries from the specified set or flush all sets if none is given.
 func (ipset *IPSet) Flush() error {
-	_, err := ipset.run("flush")
-	if err != nil {
-		return err
+	for _, s := range ipset.Sets {
+		if err := s.Flush(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -416,10 +549,11 @@ func (ipset *IPSet) Get(setName string) *Set {
 
 // Rename a set. Set identified by SETNAME-TO must not exist.
 func (set *Set) Rename(newName string) error {
-	if set.Parent.isIpv6 {
-		newName = "ipv6:" + newName
-	}
-	_, err := set.Parent.run("rename", set.name(), newName)
+	return set.perProtoMethodWrapper(set._rename, newName)
+}
+
+func (set *Set) _rename(p Proto, args ...interface{}) error {
+	_, err := set.Parent.run("rename", set.name(p), args[0].(string))
 	if err != nil {
 		return err
 	}
@@ -429,82 +563,81 @@ func (set *Set) Rename(newName string) error {
 // Swap the content of two sets, or in another words, exchange the name of two
 // sets. The referred sets must exist and compatible type of sets can be
 // swapped only.
-func (set *Set) Swap(setTo *Set) error {
-	_, err := set.Parent.run("swap", set.name(), setTo.name())
-	if err != nil {
-		return err
+func (set *Set) swap(setTo *Set) error {
+	return set.perProtoMethodWrapper(set._swap, setTo.Name)
+}
+
+func (set *Set) _swap(p Proto, args ...interface{}) (err error) {
+	swapWith := args[0].(string)
+	_, err = set.Parent.run("swap", set.name(p), getSystemName(p, swapWith))
+	return err
+}
+
+func (set *Set) Append(options ...string) {
+	if options[0] == "" {
+		return
 	}
-	return nil
+	entry := &Entry{
+		Set:     set,
+		Options: options,
+	}
+	proto := entry.getProtocol()
+	set.Entries[proto] = append(set.Entries[proto], entry)
 }
 
 // Refresh a Set with new entries.
-func (set *Set) Refresh(entries []string, extraOptions ...string) error {
-	var err error
+func (set *Set) _refresh(entries interface{}) (err error) {
+	set.lock.Lock()
+	defer set.lock.Unlock()
+
 	// The set-name must be < 32 characters!
 	tempName := set.Name + "-"
-
 	newSet := &Set{
 		Parent:  set.Parent,
 		Name:    tempName,
 		Options: set.Options,
+		Entries: make(perProtoEntryMapType),
 	}
 
-	err = set.Parent.Add(newSet)
-	if err != nil {
-		return err
-	}
-
-	for _, entry := range entries {
-		_, err = newSet.Add(entry)
-		if err != nil {
-			return err
+	switch eTyped := entries.(type) {
+	case []string:
+		for _, e := range eTyped {
+			newSet.Append(e)
+		}
+	case [][]string:
+		for _, e := range eTyped {
+			newSet.Append(e...)
+		}
+	case []*net.IPNet:
+		for _, e := range eTyped {
+			newSet.Append(e.IP.String())
 		}
 	}
 
-	err = set.Swap(newSet)
-	if err != nil {
-		return err
+	err = newSet.Restore()
+
+	if err == nil {
+		set.Entries = newSet.Entries
+		err = newSet.swap(set)
 	}
 
-	err = set.Parent.Destroy(tempName)
-	if err != nil {
-		return err
+	if err == nil {
+		err = newSet.Destroy()
 	}
 
-	return nil
+	return
+}
+
+// Refresh a Set with new entries.
+func (set *Set) Refresh(entries interface{}, extraOptions ...string) (err error) {
+	return set._refresh(entries)
 }
 
 // Refresh a Set with new entries with built-in options.
-func (set *Set) RefreshWithBuiltinOptions(entries [][]string) error {
-	var err error
-	tempName := set.Name + "-temp"
-	newSet := &Set{
-		Parent:  set.Parent,
-		Name:    tempName,
-		Options: set.Options,
-	}
+func (set *Set) RefreshWithBuiltinOptions(entries [][]string) (err error) {
+	return set._refresh(entries)
+}
 
-	err = set.Parent.Add(newSet)
-	if err != nil {
-		return err
-	}
-
-	for _, entry := range entries {
-		_, err = newSet.Add(entry...)
-		if err != nil {
-			return err
-		}
-	}
-
-	err = set.Swap(newSet)
-	if err != nil {
-		return err
-	}
-
-	err = set.Parent.Destroy(tempName)
-	if err != nil {
-		return err
-	}
-
-	return nil
+func (set *Set) RefreshWithIPNet(entries []*net.IPNet) (err error) {
+	return set._refresh(entries)
 }

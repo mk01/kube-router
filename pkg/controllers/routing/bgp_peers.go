@@ -110,33 +110,9 @@ func (nrc *NetworkRoutingController) syncInternalPeers() {
 					LocalRestarting: true,
 				},
 			}
-
-			n.AfiSafis = []config.AfiSafi{
-				{
-					Config: config.AfiSafiConfig{
-						AfiSafiName: config.AFI_SAFI_TYPE_IPV4_UNICAST,
-						Enabled:     true,
-					},
-					MpGracefulRestart: config.MpGracefulRestart{
-						Config: config.MpGracefulRestartConfig{
-							Enabled: true,
-						},
-					},
-				},
-				{
-					Config: config.AfiSafiConfig{
-						AfiSafiName: config.AFI_SAFI_TYPE_IPV6_UNICAST,
-						Enabled:     true,
-					},
-					MpGracefulRestart: config.MpGracefulRestart{
-						Config: config.MpGracefulRestartConfig{
-							Enabled: true,
-						},
-					},
-				},
-			}
 		}
 
+		injectAsiSafiConfigs(nodeIP, true, n.AfiSafis)
 		// we are rr-server peer with other rr-client with reflection enabled
 		if nrc.bgpRRServer {
 			if _, ok := node.ObjectMeta.Annotations[rrClientAnnotation]; ok {
@@ -205,32 +181,9 @@ func connectToExternalBGPPeers(server *gobgp.BgpServer, peerNeighbors []*config.
 					LocalRestarting: true,
 				},
 			}
-
-			n.AfiSafis = []config.AfiSafi{
-				{
-					Config: config.AfiSafiConfig{
-						AfiSafiName: config.AFI_SAFI_TYPE_IPV4_UNICAST,
-						Enabled:     true,
-					},
-					MpGracefulRestart: config.MpGracefulRestart{
-						Config: config.MpGracefulRestartConfig{
-							Enabled: true,
-						},
-					},
-				},
-				{
-					Config: config.AfiSafiConfig{
-						AfiSafiName: config.AFI_SAFI_TYPE_IPV6_UNICAST,
-						Enabled:     true,
-					},
-					MpGracefulRestart: config.MpGracefulRestart{
-						Config: config.MpGracefulRestartConfig{
-							Enabled: true,
-						},
-					},
-				},
-			}
 		}
+
+		injectAsiSafiConfigs(net.ParseIP(n.Config.NeighborAddress), bgpGracefulRestart, n.AfiSafis)
 		if peerMultihopTtl > 1 {
 			n.EbgpMultihop = config.EbgpMultihop{
 				Config: config.EbgpMultihopConfig{
@@ -246,8 +199,8 @@ func connectToExternalBGPPeers(server *gobgp.BgpServer, peerNeighbors []*config.
 		err := server.AddNeighbor(n)
 		peerConfig := n.Config
 		if err != nil {
-			return fmt.Errorf("Error peering with peer router "+
-				"%q due to: %s", peerConfig.NeighborAddress, err)
+			return fmt.Errorf("Error peering with peer router %q due to: %s",
+				peerConfig.NeighborAddress, err)
 		}
 		glog.V(2).Infof("Successfully configured %s in ASN %v as BGP peer to the node",
 			peerConfig.NeighborAddress, peerConfig.PeerAs)

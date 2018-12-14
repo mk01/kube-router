@@ -8,7 +8,10 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/vishvananda/netlink"
+	"github.com/cloudnativelabs/kube-router/pkg/utils"
+	"github.com/cloudnativelabs/kube-router/pkg/utils/net-tools"
+	"github.com/osrg/gobgp/config"
+	"github.com/osrg/gobgp/packet/bgp"
 )
 
 // Used for processing Annotations that may contain multiple items
@@ -72,50 +75,53 @@ func stringSliceB64Decode(s []string) ([]string, error) {
 	return ss, nil
 }
 
-func ipv4IsEnabled() bool {
-	l, err := net.Listen("tcp4", "")
+func getNodeSubnet(linkFilter func(p net.Interface) bool, nodeIP net.IP) (*netutils.IqIp, string, error) {
+	links, err := net.Interfaces()
 	if err != nil {
-		return false
-	}
-	l.Close()
-
-	return true
-}
-
-func ipv6IsEnabled() bool {
-	// If ipv6 is disabled with;
-	//
-	//  sysctl -w net.ipv6.conf.all.disable_ipv6=1
-	//
-	// It is still possible to listen on the any-address "::". So this
-	// function tries the loopback address "::1" which must be present
-	// if ipv6 is enabled.
-	l, err := net.Listen("tcp6", "[::1]:0")
-	if err != nil {
-		return false
-	}
-	l.Close()
-
-	return true
-}
-
-func getNodeSubnet(nodeIp net.IP) (net.IPNet, string, error) {
-	links, err := netlink.LinkList()
-	if err != nil {
-		return net.IPNet{}, "", errors.New("Failed to get list of links")
+		return netutils.NewIP(nodeIP), "", errors.New("Failed to get list of links")
 	}
 	for _, link := range links {
-		addresses, err := netlink.AddrList(link, netlink.FAMILY_ALL)
+		if !linkFilter(link) {
+			continue
+		}
+		addresses, err := link.Addrs()
 		if err != nil {
-			return net.IPNet{}, "", errors.New("Failed to get list of addr")
+			return netutils.NewIP(nodeIP), "", errors.New("Failed to get list of addr")
 		}
 		for _, addr := range addresses {
-			if addr.IPNet.IP.Equal(nodeIp) {
-				return *addr.IPNet, link.Attrs().Name, nil
+			if ip := netutils.NewIP(addr.String()); ip.ToIP().Equal(nodeIP) {
+				return ip, link.Name, nil
 			}
 		}
 	}
-	return net.IPNet{}, "", errors.New("Failed to find interface with specified node ip")
+	return netutils.NewIP(nodeIP), "", errors.New("Failed to find interface with specified node ip")
+}
+
+func SearchForBiggerPrefix(ip net.IP) (net.IPNet, string, error) {
+	ipnet, link, err := getNodeSubnet(utils.FilterInterfaces, ip)
+	if err != nil {
+		return *ipnet.ToIPNet(), link, err
+	}
+	ifnet, err := net.InterfaceByName(link)
+	if err != nil {
+		return *ipnet.ToIPNet(), link, err
+	}
+	addrs, err := ifnet.Addrs()
+	if err != nil {
+		return *ipnet.ToIPNet(), link, err
+	}
+
+	for _, addr := range addrs {
+		toCheck := netutils.NewIP(addr)
+		if ipnet.ToIP().Equal(toCheck.ToIP()) {
+			continue
+		}
+
+		if toCheck.Contains(ipnet) && ipnet.ToPrefix() > toCheck.ToPrefix() {
+			ipnet = toCheck
+		}
+	}
+	return *ipnet.ToIPNet(), link, nil
 }
 
 // generateTunnelName will generate a name for a tunnel interface given a node IP
@@ -124,11 +130,48 @@ func getNodeSubnet(nodeIp net.IP) (net.IPNet, string, error) {
 // is greater than 12 (after removing "."), then the interface name is tunXYZ
 // as opposed to tun-XYZ
 func generateTunnelName(nodeIP string) string {
-	hash := strings.Replace(nodeIP, ".", "", -1)
+	var deleteChar = "."
+	ip := netutils.NewIP(nodeIP)
 
-	if len(hash) < 12 {
-		return "tun-" + hash
+	if !ip.IsIPv4() {
+		deleteChar = ":"
 	}
 
-	return "tun" + hash
+	// canonize, remove "[:.]" and substring last 11 chars
+	hash := strings.Replace(ip.ToString(), deleteChar, "", -1)
+	if len(hash) > 11 {
+		hash = hash[len(hash)-11:]
+	}
+
+	return "tun-" + hash
+}
+
+func getAfiSafiTypes(ip net.IP) []config.AfiSafiType {
+	if netutils.NewIP(ip).IsIPv4() {
+		return []config.AfiSafiType{config.AFI_SAFI_TYPE_IPV4_UNICAST}
+	}
+	return []config.AfiSafiType{config.AFI_SAFI_TYPE_IPV6_UNICAST, config.AFI_SAFI_TYPE_IPV4_UNICAST}
+}
+
+func injectAsiSafiConfigs(ip net.IP, bgpGracefulRestart bool, addTo []config.AfiSafi) {
+	for _, AfiSafi := range getAfiSafiTypes(ip) {
+		addTo = append(addTo, config.AfiSafi{
+			Config: config.AfiSafiConfig{
+				AfiSafiName: AfiSafi,
+				Enabled:     true,
+			},
+			MpGracefulRestart: config.MpGracefulRestart{
+				Config: config.MpGracefulRestartConfig{
+					Enabled: bgpGracefulRestart,
+				},
+			},
+		})
+	}
+}
+
+func getPathAttributes(cidr *netutils.IqIp, node *netutils.IqIp) []bgp.PathAttributeInterface {
+	return []bgp.PathAttributeInterface{
+		bgp.NewPathAttributeOrigin(bgp.BGP_ORIGIN_ATTR_TYPE_IGP),
+		node.ToBgpRouteAttrs(cidr),
+	}
 }

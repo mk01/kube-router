@@ -5,7 +5,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/docker/libnetwork/ipvs"
+	"github.com/mqliang/libipvs"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"github.com/vishvananda/netlink"
@@ -18,17 +18,17 @@ import (
 )
 
 type LinuxNetworkingMockImpl struct {
-	ipvsSvcs []*ipvs.Service
+	ipvsSvcs ipvsServiceArrayType
 }
 
 func NewLinuxNetworkMock() *LinuxNetworkingMockImpl {
 	lnm := &LinuxNetworkingMockImpl{
-		ipvsSvcs: make([]*ipvs.Service, 0, 64),
+		ipvsSvcs: make(ipvsServiceArrayType, 0, 64),
 	}
 	return lnm
 }
 
-func (lnm *LinuxNetworkingMockImpl) getKubeDummyInterface() (netlink.Link, error) {
+func (lnm *LinuxNetworkingMockImpl) getKubeDummyInterface(force ...bool) (netlink.Link, error) {
 	var iface netlink.Link
 	iface, err := netlink.LinkByName("lo")
 	return iface, err
@@ -36,42 +36,38 @@ func (lnm *LinuxNetworkingMockImpl) getKubeDummyInterface() (netlink.Link, error
 func (lnm *LinuxNetworkingMockImpl) setupPolicyRoutingForDSR() error {
 	return nil
 }
-func (lnm *LinuxNetworkingMockImpl) setupRoutesForExternalIPForDSR(s serviceInfoMap) error {
+func (lnm *LinuxNetworkingMockImpl) setupRoutesForExternalIPForDSR(s *serviceInfoMapType) error {
 	return nil
 }
-func (lnm *LinuxNetworkingMockImpl) ipvsGetServices() ([]*ipvs.Service, error) {
+func (lnm *LinuxNetworkingMockImpl) ipvsGetServices() ipvsServiceArrayType {
 	// need to return a copy, else if the caller does `range svcs` and then calls
 	// DelService (on the returned svcs reference), it'll skip the "next" element
-	svcsCopy := make([]*ipvs.Service, len(lnm.ipvsSvcs))
+	svcsCopy := make(ipvsServiceArrayType, len(lnm.ipvsSvcs))
 	copy(svcsCopy, lnm.ipvsSvcs)
-	return svcsCopy, nil
+	return svcsCopy
 }
-func (lnm *LinuxNetworkingMockImpl) ipAddrAdd(iface netlink.Link, addr string, addRouter bool) error {
+func (lnm *LinuxNetworkingMockImpl) ipAddrAdd(iface netlink.Link, ip *net.IPNet, addRoute bool) error {
 	return nil
 }
-func (lnm *LinuxNetworkingMockImpl) ipvsAddServer(ipvsSvc *ipvs.Service, ipvsDst *ipvs.Destination) error {
+func (lnm *LinuxNetworkingMockImpl) ipvsAddServer(ks *KubeService, ep *endpointInfo, update bool) error {
 	return nil
 }
-func (lnm *LinuxNetworkingMockImpl) ipvsAddService(svcs []*ipvs.Service, vip net.IP, protocol, port uint16, persistent bool, scheduler string, flags schedFlags) (*ipvs.Service, error) {
-	svc := &ipvs.Service{
-		Address:  vip,
-		Protocol: protocol,
-		Port:     port,
-	}
+func (lnm *LinuxNetworkingMockImpl) ipvsAddService(ks *KubeService, update bool) (*libipvs.Service, error) {
+	svc := ks.Service
 	lnm.ipvsSvcs = append(lnm.ipvsSvcs, svc)
 	return svc, nil
 }
-func (lnm *LinuxNetworkingMockImpl) ipvsDelService(ipvsSvc *ipvs.Service) error {
+func (lnm *LinuxNetworkingMockImpl) ipvsDelService(ks *KubeService) error {
 	for idx, svc := range lnm.ipvsSvcs {
-		if svc.Address.Equal(ipvsSvc.Address) && svc.Protocol == ipvsSvc.Protocol && svc.Port == ipvsSvc.Port {
+		if svc.Address.Equal(ks.Address) && svc.Protocol == ks.Protocol && svc.Port == ks.Port {
 			lnm.ipvsSvcs = append(lnm.ipvsSvcs[:idx], lnm.ipvsSvcs[idx+1:]...)
 			break
 		}
 	}
 	return nil
 }
-func (lnm *LinuxNetworkingMockImpl) ipvsGetDestinations(ipvsSvc *ipvs.Service) ([]*ipvs.Destination, error) {
-	return []*ipvs.Destination{}, nil
+func (lnm *LinuxNetworkingMockImpl) ipvsGetDestinations(ipvsSvc *libipvs.Service) ipvsDestinationArrayType {
+	return make(ipvsDestinationArrayType, 0)
 }
 func (lnm *LinuxNetworkingMockImpl) cleanupMangleTableRule(ip string, protocol string, port string, fwmark string) error {
 	return nil
@@ -118,7 +114,7 @@ var _ = Describe("NetworkServicesController", func() {
 	BeforeEach(func() {
 		lnm = NewLinuxNetworkMock()
 		mockedLinuxNetworking = &LinuxNetworkingMock{
-			cleanupMangleTableRuleFunc:         lnm.cleanupMangleTableRule,
+			//cleanupMangleTableRuleFunc:         lnm.cleanupMangleTableRule,
 			getKubeDummyInterfaceFunc:          lnm.getKubeDummyInterface,
 			ipAddrAddFunc:                      lnm.ipAddrAdd,
 			ipvsAddServerFunc:                  lnm.ipvsAddServer,
@@ -154,11 +150,10 @@ var _ = Describe("NetworkServicesController", func() {
 		waitForListerWithTimeoutG(nsc.svcLister, time.Second*10)
 		waitForListerWithTimeoutG(nsc.epLister, time.Second*10)
 
-		nsc.serviceMap = nsc.buildServicesInfo()
-		nsc.endpointsMap = nsc.buildEndpointsInfo()
+		nsc.buildServicesInfo(&nsc.serviceMap)
 	})
-	Context("service no endpoints with externalIPs", func() {
-		var fooSvc1, fooSvc2 *ipvs.Service
+	Context("service no endpoints with ExternalIPs", func() {
+		var fooSvc1, fooSvc2 *libipvs.Service
 		var syncErr error
 		BeforeEach(func() {
 			testcase = &TestCaseSvcEPs{
@@ -169,7 +164,7 @@ var _ = Describe("NetworkServicesController", func() {
 						ClusterIP:   "10.0.0.1",
 						ExternalIPs: []string{"1.1.1.1", "2.2.2.2"},
 						Ports: []v1core.ServicePort{
-							{Name: "port-1", Port: 8080, Protocol: "TCP"},
+							{Name: "Port-1", Port: 8080, Protocol: "TCP"},
 						},
 					},
 				},
@@ -178,22 +173,22 @@ var _ = Describe("NetworkServicesController", func() {
 			}
 		})
 		JustBeforeEach(func() {
-			// pre-inject some foo ipvs Service to verify its deletion
-			fooSvc1, _ = lnm.ipvsAddService(lnm.ipvsSvcs, net.ParseIP("1.2.3.4"), 6, 1234, false, "rr", schedFlags{})
-			fooSvc2, _ = lnm.ipvsAddService(lnm.ipvsSvcs, net.ParseIP("5.6.7.8"), 6, 5678, false, "rr", schedFlags{true, true, false})
-			syncErr = nsc.syncIpvsServices(nsc.serviceMap, nsc.endpointsMap)
+			// pre-inject some foo Ipvs Service to verify its deletion
+			fooSvc1, _ = lnm.ipvsAddService(&KubeService{Service: &libipvs.Service{Address: net.ParseIP("1.2.3.4"), Protocol: 6, Port: 1234}}, false)
+			fooSvc2, _ = lnm.ipvsAddService(&KubeService{Service: &libipvs.Service{Address: net.ParseIP("1.2.3.4"), Protocol: 6, Port: 1234}}, false)
+			syncErr = nsc.syncIpvsServices()
 		})
 		It("Should have called syncIpvsServices OK", func() {
 			Expect(syncErr).To(Succeed())
 		})
-		It("Should have called cleanupMangleTableRule for ExternalIPs", func() {
-			Expect(
-				fmt.Sprintf("%v", mockedLinuxNetworking.cleanupMangleTableRuleCalls())).To(
-				Equal(
-					fmt.Sprintf("[{1.1.1.1 tcp 8080 %d} {2.2.2.2 tcp 8080 %d}]",
-						generateFwmark("1.1.1.1", "tcp", "8080"),
-						generateFwmark("2.2.2.2", "tcp", "8080"))))
-		})
+		/*		It("Should have called cleanupMangleTableRule for ExternalIPs", func() {
+				Expect(
+					fmt.Sprintf("%v", mockedLinuxNetworking.cleanupMangleTableRuleCalls())).To(
+					Equal(
+						fmt.Sprintf("[{1.1.1.1 tcp 8080 %d} {2.2.2.2 tcp 8080 %d}]",
+							generateFwmark(&libipvs.Service{Address: netutils.NewIP("1.1.1.1").ToIP(), Protocol: syscall.IPPROTO_TCP, Port: 8080}),
+							generateFwmark(&libipvs.Service{Address: netutils.NewIP("2.2.2.2").ToIP(), Protocol: syscall.IPPROTO_TCP, Port: 8080}))))
+			})*/
 		It("Should have called setupPolicyRoutingForDSR", func() {
 			Expect(
 				mockedLinuxNetworking.setupPolicyRoutingForDSRCalls()).To(
@@ -204,17 +199,17 @@ var _ = Describe("NetworkServicesController", func() {
 				mockedLinuxNetworking.getKubeDummyInterfaceCalls()).To(
 				HaveLen(1))
 		})
-		It("Should have called setupRoutesForExternalIPForDSR with serviceInfoMap", func() {
+		It("Should have called setupRoutesForExternalIPForDSR with serviceInfoMapType", func() {
 			Expect(
 				mockedLinuxNetworking.setupRoutesForExternalIPForDSRCalls()).To(
 				ContainElement(
-					struct{ In1 serviceInfoMap }{In1: nsc.serviceMap}))
+					struct{ In1 serviceInfoMapType }{In1: nsc.serviceMap}))
 		})
 		It("Should have called ipAddrAdd for ClusterIP and ExternalIPs", func() {
 			Expect((func() []string {
 				ret := []string{}
 				for _, addr := range mockedLinuxNetworking.ipAddrAddCalls() {
-					ret = append(ret, addr.IP)
+					ret = append(ret, addr.IP.String())
 				}
 				return ret
 			})()).To(
@@ -230,8 +225,8 @@ var _ = Describe("NetworkServicesController", func() {
 				ret := []string{}
 				for _, args := range mockedLinuxNetworking.ipvsAddServiceCalls() {
 					ret = append(ret, fmt.Sprintf("%v:%v:%v:%v:%v",
-						args.Vip, args.Protocol, args.Port,
-						args.Persistent, args.Scheduler))
+						args.Ks.Address.String(), args.Ks.Protocol, args.Ks.Port,
+						args.Ks.Flags.Flags&libipvs.IP_VS_SVC_F_PERSISTENT == libipvs.IP_VS_SVC_F_PERSISTENT, args.Ks.SchedName))
 				}
 				return ret
 			}()).To(
@@ -254,7 +249,7 @@ var _ = Describe("NetworkServicesController", func() {
 						ClusterIP:   "10.0.0.1",
 						ExternalIPs: []string{"1.1.1.1", "2.2.2.2"},
 						Ports: []v1core.ServicePort{
-							{Name: "port-1", Protocol: "TCP", Port: 8080},
+							{Name: "Port-1", Protocol: "TCP", Port: 8080},
 						},
 					},
 					Status: v1core.ServiceStatus{
@@ -271,7 +266,7 @@ var _ = Describe("NetworkServicesController", func() {
 			}
 		})
 		JustBeforeEach(func() {
-			syncErr = nsc.syncIpvsServices(nsc.serviceMap, nsc.endpointsMap)
+			syncErr = nsc.syncIpvsServices()
 		})
 		It("Should have called syncIpvsServices OK", func() {
 			Expect(syncErr).To(Succeed())
@@ -280,7 +275,7 @@ var _ = Describe("NetworkServicesController", func() {
 			Expect((func() []string {
 				ret := []string{}
 				for _, addr := range mockedLinuxNetworking.ipAddrAddCalls() {
-					ret = append(ret, addr.IP)
+					ret = append(ret, addr.IP.String())
 				}
 				return ret
 			})()).To(
@@ -292,8 +287,8 @@ var _ = Describe("NetworkServicesController", func() {
 				ret := []string{}
 				for _, args := range mockedLinuxNetworking.ipvsAddServiceCalls() {
 					ret = append(ret, fmt.Sprintf("%v:%v:%v:%v:%v",
-						args.Vip, args.Protocol, args.Port,
-						args.Persistent, args.Scheduler))
+						args.Ks.Address.String(), args.Ks.Protocol, args.Ks.Port,
+						args.Ks.Flags.Flags&libipvs.IP_VS_SVC_F_PERSISTENT == libipvs.IP_VS_SVC_F_PERSISTENT, args.Ks.SchedName))
 				}
 				return ret
 			}()).To(
@@ -321,7 +316,7 @@ var _ = Describe("NetworkServicesController", func() {
 						ClusterIP:   "10.0.0.1",
 						ExternalIPs: []string{"1.1.1.1", "2.2.2.2"},
 						Ports: []v1core.ServicePort{
-							{Name: "port-1", Protocol: "TCP", Port: 8080},
+							{Name: "Port-1", Protocol: "TCP", Port: 8080},
 						},
 					},
 					Status: v1core.ServiceStatus{
@@ -338,7 +333,7 @@ var _ = Describe("NetworkServicesController", func() {
 			}
 		})
 		JustBeforeEach(func() {
-			syncErr = nsc.syncIpvsServices(nsc.serviceMap, nsc.endpointsMap)
+			syncErr = nsc.syncIpvsServices()
 		})
 		It("Should have called syncIpvsServices OK", func() {
 			Expect(syncErr).To(Succeed())
@@ -347,7 +342,7 @@ var _ = Describe("NetworkServicesController", func() {
 			Expect((func() []string {
 				ret := []string{}
 				for _, addr := range mockedLinuxNetworking.ipAddrAddCalls() {
-					ret = append(ret, addr.IP)
+					ret = append(ret, addr.IP.String())
 				}
 				return ret
 			})()).To(
@@ -359,8 +354,8 @@ var _ = Describe("NetworkServicesController", func() {
 				ret := []string{}
 				for _, args := range mockedLinuxNetworking.ipvsAddServiceCalls() {
 					ret = append(ret, fmt.Sprintf("%v:%v:%v:%v:%v",
-						args.Vip, args.Protocol, args.Port,
-						args.Persistent, args.Scheduler))
+						args.Ks.Address.String(), args.Ks.Protocol, args.Ks.Port,
+						args.Ks.Flags.Flags&libipvs.IP_VS_SVC_F_PERSISTENT == libipvs.IP_VS_SVC_F_PERSISTENT, args.Ks.SchedName))
 				}
 				return ret
 			}()).To(
@@ -383,7 +378,7 @@ var _ = Describe("NetworkServicesController", func() {
 						ClusterIP:   "10.0.0.1",
 						ExternalIPs: []string{"1.1.1.1", "2.2.2.2"},
 						Ports: []v1core.ServicePort{
-							{Name: "port-1", Protocol: "TCP", Port: 8080},
+							{Name: "Port-1", Protocol: "TCP", Port: 8080},
 						},
 					},
 					Status: v1core.ServiceStatus{
@@ -399,7 +394,7 @@ var _ = Describe("NetworkServicesController", func() {
 			}
 		})
 		JustBeforeEach(func() {
-			syncErr = nsc.syncIpvsServices(nsc.serviceMap, nsc.endpointsMap)
+			syncErr = nsc.syncIpvsServices()
 		})
 		It("Should have called syncIpvsServices OK", func() {
 			Expect(syncErr).To(Succeed())
@@ -408,7 +403,7 @@ var _ = Describe("NetworkServicesController", func() {
 			Expect((func() []string {
 				ret := []string{}
 				for _, addr := range mockedLinuxNetworking.ipAddrAddCalls() {
-					ret = append(ret, addr.IP)
+					ret = append(ret, addr.IP.String())
 				}
 				return ret
 			})()).To(
@@ -420,8 +415,8 @@ var _ = Describe("NetworkServicesController", func() {
 				ret := []string{}
 				for _, args := range mockedLinuxNetworking.ipvsAddServiceCalls() {
 					ret = append(ret, fmt.Sprintf("%v:%v:%v:%v:%v",
-						args.Vip, args.Protocol, args.Port,
-						args.Persistent, args.Scheduler))
+						args.Ks.Address.String(), args.Ks.Protocol, args.Ks.Port,
+						args.Ks.Flags.Flags&libipvs.IP_VS_SVC_F_PERSISTENT == libipvs.IP_VS_SVC_F_PERSISTENT, args.Ks.SchedName))
 				}
 				return ret
 			}()).To(
@@ -442,7 +437,7 @@ var _ = Describe("NetworkServicesController", func() {
 						ClusterIP:   "10.0.0.1",
 						ExternalIPs: []string{"1.1.1.1", "2.2.2.2"},
 						Ports: []v1core.ServicePort{
-							{Name: "port-1", Protocol: "TCP", Port: 8080},
+							{Name: "Port-1", Protocol: "TCP", Port: 8080},
 						},
 					},
 				},
@@ -458,7 +453,7 @@ var _ = Describe("NetworkServicesController", func() {
 								{IP: "172.20.1.2", NodeName: ptrToString("node-2")},
 							},
 							Ports: []v1core.EndpointPort{
-								{Name: "port-1", Port: 80, Protocol: "TCP"},
+								{Name: "Port-1", Port: 80, Protocol: "TCP"},
 							},
 						},
 					},
@@ -467,7 +462,7 @@ var _ = Describe("NetworkServicesController", func() {
 			}
 		})
 		JustBeforeEach(func() {
-			syncErr = nsc.syncIpvsServices(nsc.serviceMap, nsc.endpointsMap)
+			syncErr = nsc.syncIpvsServices()
 		})
 		It("Should have called syncIpvsServices OK", func() {
 			Expect(syncErr).To(Succeed())
@@ -477,8 +472,8 @@ var _ = Describe("NetworkServicesController", func() {
 				ret := []string{}
 				for _, args := range mockedLinuxNetworking.ipvsAddServiceCalls() {
 					ret = append(ret, fmt.Sprintf("%v:%v:%v:%v:%v",
-						args.Vip, args.Protocol, args.Port,
-						args.Persistent, args.Scheduler))
+						args.Ks.Address.String(), args.Ks.Protocol, args.Ks.Port,
+						args.Ks.Flags.Flags&libipvs.IP_VS_SVC_F_PERSISTENT == libipvs.IP_VS_SVC_F_PERSISTENT, args.Ks.SchedName))
 				}
 				return ret
 			})()).To(ConsistOf(
@@ -488,8 +483,8 @@ var _ = Describe("NetworkServicesController", func() {
 			Expect((func() []string {
 				ret := []string{}
 				for _, args := range mockedLinuxNetworking.ipvsAddServerCalls() {
-					svc := args.IpvsSvc
-					dst := args.IpvsDst
+					svc := args.Ks
+					dst := args.Ep.Destination
 					ret = append(ret, fmt.Sprintf("%v:%v->%v:%v",
 						svc.Address, svc.Port,
 						dst.Address, dst.Port))

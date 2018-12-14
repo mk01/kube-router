@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/cloudnativelabs/kube-router/pkg/utils"
+	"github.com/cloudnativelabs/kube-router/pkg/utils/net-tools"
 	"github.com/osrg/gobgp/config"
 	"github.com/osrg/gobgp/table"
 	v1core "k8s.io/api/core/v1"
@@ -41,7 +42,7 @@ func (nrc *NetworkRoutingController) addExportPolicies() error {
 		PrefixSetName: "podcidrprefixset",
 		PrefixList: []config.Prefix{
 			{
-				IpPrefix: cidr,
+				IpPrefix: cidr.String(),
 			},
 		},
 	})
@@ -54,7 +55,7 @@ func (nrc *NetworkRoutingController) addExportPolicies() error {
 	advIpPrefixList := make([]config.Prefix, 0)
 	advIps, _, _ := nrc.getAllVIPs()
 	for _, ip := range advIps {
-		advIpPrefixList = append(advIpPrefixList, config.Prefix{IpPrefix: ip + "/32"})
+		advIpPrefixList = append(advIpPrefixList, config.Prefix{IpPrefix: netutils.NewIP(ip).ToCIDR()})
 	}
 	clusterIpPrefixSet, err := table.NewPrefixSet(config.PrefixSet{
 		PrefixSetName: "clusteripprefixset",

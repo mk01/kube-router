@@ -17,6 +17,8 @@ import (
 )
 
 const (
+	CONTROLLER_NAME = "Metrics controller"
+
 	namespace = "kube_router"
 )
 
@@ -149,6 +151,10 @@ type Controller struct {
 	MetricsPort uint16
 	mu          sync.Mutex
 	nodeIP      net.IP
+}
+
+func (mc *Controller) GetName() string {
+	return CONTROLLER_NAME
 }
 
 // Run prometheus metrics controller

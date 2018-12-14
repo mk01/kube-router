@@ -45,16 +45,17 @@ func GetNodeObject(clientset kubernetes.Interface, hostnameOverride string) (*ap
 // 1. NodeInternalIP
 // 2. NodeExternalIP (Only set on cloud providers usually)
 func GetNodeIP(node *apiv1.Node) (net.IP, error) {
-	addresses := node.Status.Addresses
-	addressMap := make(map[apiv1.NodeAddressType][]apiv1.NodeAddress)
-	for i := range addresses {
-		addressMap[addresses[i].Type] = append(addressMap[addresses[i].Type], addresses[i])
+	var address *apiv1.NodeAddress
+	for _, nodeAddress := range node.Status.Addresses {
+		if nodeAddress.Type == apiv1.NodeInternalIP {
+			return net.ParseIP(nodeAddress.Address), nil
+		}
+		if nodeAddress.Type == apiv1.NodeExternalIP {
+			address = &nodeAddress
+		}
 	}
-	if addresses, ok := addressMap[apiv1.NodeInternalIP]; ok {
-		return net.ParseIP(addresses[0].Address), nil
-	}
-	if addresses, ok := addressMap[apiv1.NodeExternalIP]; ok {
-		return net.ParseIP(addresses[0].Address), nil
+	if address != nil {
+		return net.ParseIP(address.Address), nil
 	}
 	return nil, errors.New("host IP unknown")
 }

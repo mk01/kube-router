@@ -2268,8 +2268,8 @@ func Test_generateTunnelName(t *testing.T) {
 		},
 		{
 			"IP has 12 characters after removing '.'",
-			"100.200.300.400",
-			"tun100200300400",
+			"100.200.210.220",
+			"tun-00200210220",
 		},
 	}
 

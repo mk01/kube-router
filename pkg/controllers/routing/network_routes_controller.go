@@ -7,7 +7,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,25 +15,30 @@ import (
 	"github.com/cloudnativelabs/kube-router/pkg/healthcheck"
 	"github.com/cloudnativelabs/kube-router/pkg/metrics"
 	"github.com/cloudnativelabs/kube-router/pkg/options"
-	"github.com/cloudnativelabs/kube-router/pkg/utils"
-	"github.com/coreos/go-iptables/iptables"
 	"github.com/golang/glog"
 	bgpapi "github.com/osrg/gobgp/api"
 	"github.com/osrg/gobgp/config"
-	"github.com/osrg/gobgp/packet/bgp"
 	gobgp "github.com/osrg/gobgp/server"
 	"github.com/osrg/gobgp/table"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netlink/nl"
 
+	"github.com/cloudnativelabs/kube-router/pkg/utils"
+	"github.com/cloudnativelabs/kube-router/pkg/utils/net-tools"
+	"github.com/coreos/go-iptables/iptables"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 )
 
 const (
+	CONTROLLER_NAME = "Routes controller"
+
 	IFACE_NOT_FOUND = "Link not found"
+
+	CHAIN_BGP_EGRESS_RULE = "KUBE-ROUTER-BGP-EGRESS"
 
 	customRouteTableID   = "77"
 	customRouteTableName = "kube-router"
@@ -48,6 +52,7 @@ const (
 	peerIPAnnotation                   = "kube-router.io/peer.ips"
 	peerPasswordAnnotation             = "kube-router.io/peer.passwords"
 	peerPortAnnotation                 = "kube-router.io/peer.ports"
+	routerID                           = "kube-router.io/router.id"
 	rrClientAnnotation                 = "kube-router.io/rr.client"
 	rrServerAnnotation                 = "kube-router.io/rr.server"
 	svcLocalAnnotation                 = "kube-router.io/service.local"
@@ -89,7 +94,7 @@ type NetworkRoutingController struct {
 	bgpFullMeshMode         bool
 	bgpEnableInternal       bool
 	bgpGracefulRestart      bool
-	ipSetHandler            *utils.IPSet
+	ipSetHandler            *netutils.IPSet
 	enableOverlays          bool
 	overlayType             string
 	peerMultihopTTL         uint8
@@ -116,11 +121,16 @@ type NetworkRoutingController struct {
 	NodeEventHandler      cache.ResourceEventHandler
 	ServiceEventHandler   cache.ResourceEventHandler
 	EndpointsEventHandler cache.ResourceEventHandler
+
+	ipm *netutils.IpTablesManager
+}
+
+func (nrc *NetworkRoutingController) GetName() string {
+	return CONTROLLER_NAME
 }
 
 // Run runs forever until we are notified on stop channel
-func (nrc *NetworkRoutingController) Run(healthChan chan<- *healthcheck.ControllerHeartbeat, stopCh <-chan struct{}, wg *sync.WaitGroup) {
-	var err error
+func (nrc *NetworkRoutingController) Run(healthChan chan<- *healthcheck.ControllerHeartbeat, stopCh <-chan struct{}, wg *sync.WaitGroup) (err error) {
 	if nrc.enableCNI {
 		nrc.updateCNIConfig()
 	}
@@ -160,28 +170,8 @@ func (nrc *NetworkRoutingController) Run(healthChan chan<- *healthcheck.Controll
 		}
 	}
 
-	glog.V(1).Info("Performing cleanup of depreciated rules/ipsets (if needed).")
-	err = nrc.deleteBadPodEgressRules()
-	if err != nil {
-		glog.Errorf("Error cleaning up old/bad Pod egress rules: %s", err.Error())
-	}
-
-	// Handle Pod egress masquerading configuration
-	if nrc.enablePodEgress {
-		glog.V(1).Infoln("Enabling Pod egress.")
-
-		err = nrc.createPodEgressRule()
-		if err != nil {
-			glog.Errorf("Error enabling Pod egress: %s", err.Error())
-		}
-	} else {
-		glog.V(1).Infoln("Disabling Pod egress.")
-
-		err = nrc.deletePodEgressRule()
-		if err != nil {
-			glog.Warningf("Error cleaning up Pod Egress related networking: %s", err)
-		}
-	}
+	glog.V(1).Infoln("Applying pod egress configuration.")
+	nrc.enableIptables(netutils.IPTABLES_CLEAR_EXISTING_CHAIN)
 
 	// create 'kube-bridge' interface to which pods will be connected
 	_, err = netlink.LinkByName("kube-bridge")
@@ -230,7 +220,7 @@ func (nrc *NetworkRoutingController) Run(healthChan chan<- *healthcheck.Controll
 			select {
 			case <-stopCh:
 				glog.Infof("Shutting down network routes controller")
-				return
+				return err
 			case <-t.C:
 				glog.Infof("Retrying start of node BGP server")
 				continue
@@ -251,7 +241,7 @@ func (nrc *NetworkRoutingController) Run(healthChan chan<- *healthcheck.Controll
 		select {
 		case <-stopCh:
 			glog.Infof("Shutting down network routes controller")
-			return
+			return err
 		default:
 		}
 
@@ -269,6 +259,8 @@ func (nrc *NetworkRoutingController) Run(healthChan chan<- *healthcheck.Controll
 		if err != nil {
 			glog.Errorf("Failed to enable IP forwarding of traffic from pods: %s", err.Error())
 		}
+
+		nrc.enableIptables(netutils.IPTABLES_APPEND_UNIQUE)
 
 		// advertise or withdraw IPs for the services to be reachable via host
 		toAdvertise, toWithdraw, err := nrc.getActiveVIPs()
@@ -305,10 +297,11 @@ func (nrc *NetworkRoutingController) Run(healthChan chan<- *healthcheck.Controll
 		select {
 		case <-stopCh:
 			glog.Infof("Shutting down network routes controller")
-			return
+			return err
 		case <-t.C:
 		}
 	}
+	return err
 }
 
 func (nrc *NetworkRoutingController) updateCNIConfig() {
@@ -317,23 +310,31 @@ func (nrc *NetworkRoutingController) updateCNIConfig() {
 		glog.Errorf("Failed to get pod CIDR from CNI conf file: %s", err)
 	}
 
-	if reflect.DeepEqual(cidr, net.IPNet{}) {
+	if cidr == nil {
 		glog.Infof("`subnet` in CNI conf file is empty so populating `subnet` in CNI conf file with pod CIDR assigned to the node obtained from node spec.")
 	}
-	cidrlen, _ := cidr.Mask.Size()
-	oldCidr := cidr.IP.String() + "/" + strconv.Itoa(cidrlen)
 
 	currentCidr, err := utils.GetPodCidrFromNodeSpec(nrc.clientset, nrc.hostnameOverride)
 	if err != nil {
 		glog.Fatalf("Failed to get pod CIDR from node spec. kube-router relies on kube-controller-manager to allocate pod CIDR for the node or an annotation `kube-router.io/pod-cidr`. Error: %v", err)
 	}
 
-	if len(cidr.IP) == 0 || strings.Compare(oldCidr, currentCidr) != 0 {
-		err = utils.InsertPodCidrInCniSpec(nrc.cniConfFile, currentCidr)
+	if cidr == nil || cidr == currentCidr {
+		err = utils.InsertPodCidrInCniSpec(nrc.cniConfFile, currentCidr.String())
 		if err != nil {
 			glog.Fatalf("Failed to insert `subnet`(pod CIDR) into CNI conf file: %s", err.Error())
 		}
 	}
+}
+
+func (nrc *NetworkRoutingController) setRouterId(args ...string) string {
+	for _, try := range args {
+		if netutils.Isipv4(net.ParseIP(try)) {
+			nrc.routerId = try
+			break
+		}
+	}
+	return nrc.routerId
 }
 
 func (nrc *NetworkRoutingController) watchBgpUpdates() {
@@ -365,44 +366,17 @@ func (nrc *NetworkRoutingController) advertisePodRoute() error {
 	if nrc.MetricsEnabled {
 		metrics.ControllerBGPadvertisementsSent.Inc()
 	}
-	cidr, err := utils.GetPodCidrFromNodeSpec(nrc.clientset, nrc.hostnameOverride)
+
+	scidr, err := utils.GetPodCidrFromNodeSpec(nrc.clientset, nrc.hostnameOverride)
 	if err != nil {
 		return err
 	}
 
-	cidrStr := strings.Split(cidr, "/")
-	subnet := cidrStr[0]
-	cidrLen, _ := strconv.Atoi(cidrStr[1])
-	if nrc.isIpv6 {
-		prefixes := []bgp.AddrPrefixInterface{bgp.NewIPv6AddrPrefix(uint8(cidrLen), subnet)}
-		attrs := []bgp.PathAttributeInterface{
-			bgp.NewPathAttributeOrigin(bgp.BGP_ORIGIN_ATTR_TYPE_IGP),
-			// This requires some research.
-			// For ipv6 what should be next-hop value? According to	 this https://www.noction.com/blog/bgp-next-hop
-			// using the link-local	 address may be more appropriate.
-			bgp.NewPathAttributeMpReachNLRI(nrc.nodeIP.String(), prefixes),
-		}
+	cidr := netutils.NewIP(scidr)
 
-		glog.V(2).Infof("Advertising route: '%s/%s via %s' to peers using attribute: %+q", subnet, strconv.Itoa(cidrLen), nrc.nodeIP.String(), attrs)
-
-		if _, err := nrc.bgpServer.AddPath("", []*table.Path{table.NewPath(nil, bgp.NewIPv6AddrPrefix(uint8(cidrLen),
-			subnet), false, attrs, time.Now(), false)}); err != nil {
-			return fmt.Errorf(err.Error())
-		}
-	} else {
-		attrs := []bgp.PathAttributeInterface{
-			bgp.NewPathAttributeOrigin(0),
-			bgp.NewPathAttributeNextHop(nrc.nodeIP.String()),
-		}
-
-		glog.V(2).Infof("Advertising route: '%s/%s via %s' to peers", subnet, strconv.Itoa(cidrLen), nrc.nodeIP.String())
-
-		if _, err := nrc.bgpServer.AddPath("", []*table.Path{table.NewPath(nil, bgp.NewIPAddrPrefix(uint8(cidrLen),
-			subnet), false, attrs, time.Now(), false)}); err != nil {
-			return fmt.Errorf(err.Error())
-		}
-	}
-	return nil
+	glog.V(2).Infof("Advertising route: '%s via %s' to peers", cidr.ToCIDR(), nrc.nodeIP.String())
+	_, err = nrc.bgpServer.AddPath("", []*table.Path{table.NewPath(nil, cidr.ToBgpPrefix(), false, getPathAttributes(cidr, netutils.NewIP(nrc.nodeIP)), time.Now(), false)})
+	return err
 }
 
 func (nrc *NetworkRoutingController) injectRoute(path *table.Path) error {
@@ -413,6 +387,11 @@ func (nrc *NetworkRoutingController) injectRoute(path *table.Path) error {
 
 	tunnelName := generateTunnelName(nexthop.String())
 	sameSubnet := nrc.nodeSubnet.Contains(nexthop)
+	if !sameSubnet {
+		if str, _ := exec.Command("ip", netutils.NewIP(nexthop).ProtocolCmdParam().Inet, "route", "get", nexthop.String()).Output(); !strings.Contains(string(str), " via ") {
+			sameSubnet = false
+		}
+	}
 
 	// cleanup route and tunnel if overlay is disabled or node is in same subnet and overlay-type is set to 'subnet'
 	if !nrc.enableOverlays || (sameSubnet && nrc.overlayType == "subnet") {
@@ -444,9 +423,14 @@ func (nrc *NetworkRoutingController) injectRoute(path *table.Path) error {
 		// create ip-in-ip tunnel and inject route as overlay is enabled
 		var link netlink.Link
 		var err error
+
+		ipHelper := netutils.NewIP(nrc.nodeIP)
+		family := ipHelper.ProtocolCmdParam().Inet
+		mode := ipHelper.ProtocolCmdParam().Mode
+
 		link, err = netlink.LinkByName(tunnelName)
 		if err != nil {
-			out, err := exec.Command("ip", "tunnel", "add", tunnelName, "mode", "ipip", "local", nrc.nodeIP.String(),
+			out, err := exec.Command("ip", family, "tunnel", "add", tunnelName, "mode", mode, "local", nrc.nodeIP.String(),
 				"remote", nexthop.String(), "dev", nrc.nodeInterface).CombinedOutput()
 			if err != nil {
 				return fmt.Errorf("Route not injected for the route advertised by the node %s "+
@@ -470,13 +454,13 @@ func (nrc *NetworkRoutingController) injectRoute(path *table.Path) error {
 			glog.Infof("Tunnel interface: " + tunnelName + " for the node " + nexthop.String() + " already exists.")
 		}
 
-		out, err := exec.Command("ip", "route", "list", "table", customRouteTableID).CombinedOutput()
+		out, err := exec.Command("ip", family, "route", "list", "table", customRouteTableID).CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("Failed to verify if route already exists in %s table: %s",
 				customRouteTableName, err.Error())
 		}
-		if !strings.Contains(string(out), "dev "+tunnelName+" scope") {
-			if out, err = exec.Command("ip", "route", "add", nexthop.String(), "dev", tunnelName, "table",
+		if !strings.Contains(string(out), "dev "+tunnelName) {
+			if out, err = exec.Command("ip", family, "route", "add", nexthop.String(), "dev", tunnelName, "table",
 				customRouteTableID).CombinedOutput(); err != nil {
 				return fmt.Errorf("failed to add route in custom route table, err: %s, output: %s", err, string(out))
 			}
@@ -506,19 +490,10 @@ func (nrc *NetworkRoutingController) injectRoute(path *table.Path) error {
 
 // Cleanup performs the cleanup of configurations done
 func (nrc *NetworkRoutingController) Cleanup() {
-	// Pod egress cleanup
-	err := nrc.deletePodEgressRule()
-	if err != nil {
-		glog.Warningf("Error deleting Pod egress iptables rule: %s", err.Error())
-	}
-
-	err = nrc.deleteBadPodEgressRules()
-	if err != nil {
-		glog.Warningf("Error deleting Pod egress iptables rule: %s", err.Error())
-	}
+	nrc.ipm.IptablesCleanUp()
 
 	// delete all ipsets created by kube-router
-	ipset, err := utils.NewIPSet(nrc.isIpv6)
+	ipset, err := netutils.NewIPSet()
 	if err != nil {
 		glog.Errorf("Failed to clean up ipsets: " + err.Error())
 	}
@@ -533,12 +508,6 @@ func (nrc *NetworkRoutingController) Cleanup() {
 }
 
 func (nrc *NetworkRoutingController) syncNodeIPSets() error {
-	start := time.Now()
-	defer func() {
-		if nrc.MetricsEnabled {
-			metrics.ControllerRoutesSyncTime.Observe(time.Since(start).Seconds())
-		}
-	}()
 	// Get the current list of the nodes from API server
 	nodes, err := nrc.clientset.CoreV1().Nodes().List(metav1.ListOptions{})
 	if err != nil {
@@ -549,7 +518,9 @@ func (nrc *NetworkRoutingController) syncNodeIPSets() error {
 	currentPodCidrs := make([]string, 0)
 	currentNodeIPs := make([]string, 0)
 	for _, node := range nodes.Items {
-		currentPodCidrs = append(currentPodCidrs, node.Spec.PodCIDR)
+		if len(strings.TrimSpace(node.Spec.PodCIDR)) > 0 {
+			currentPodCidrs = append(currentPodCidrs, node.Spec.PodCIDR)
+		}
 		nodeIP, err := utils.GetNodeIP(&node)
 		if err != nil {
 			return fmt.Errorf("Failed to find a node IP: %s", err)
@@ -561,7 +532,7 @@ func (nrc *NetworkRoutingController) syncNodeIPSets() error {
 	psSet := nrc.ipSetHandler.Get(podSubnetsIPSetName)
 	if psSet == nil {
 		glog.Infof("Creating missing ipset \"%s\"", podSubnetsIPSetName)
-		_, err = nrc.ipSetHandler.Create(podSubnetsIPSetName, utils.OptionTimeout, "0")
+		_, err = nrc.ipSetHandler.Create(podSubnetsIPSetName, netutils.OptionTimeout, "0")
 		if err != nil {
 			return fmt.Errorf("ipset \"%s\" not found in controller instance",
 				podSubnetsIPSetName)
@@ -576,7 +547,7 @@ func (nrc *NetworkRoutingController) syncNodeIPSets() error {
 	naSet := nrc.ipSetHandler.Get(nodeAddrsIPSetName)
 	if naSet == nil {
 		glog.Infof("Creating missing ipset \"%s\"", nodeAddrsIPSetName)
-		_, err = nrc.ipSetHandler.Create(nodeAddrsIPSetName, utils.OptionTimeout, "0")
+		_, err = nrc.ipSetHandler.Create(nodeAddrsIPSetName, netutils.OptionTimeout, "0")
 		if err != nil {
 			return fmt.Errorf("ipset \"%s\" not found in controller instance",
 				nodeAddrsIPSetName)
@@ -590,20 +561,66 @@ func (nrc *NetworkRoutingController) syncNodeIPSets() error {
 	return nil
 }
 
-func (nrc *NetworkRoutingController) newIptablesCmdHandler() (*iptables.IPTables, error) {
-	if nrc.isIpv6 {
-		return iptables.NewWithProtocol(iptables.ProtocolIPv6)
+func (nrc *NetworkRoutingController) newIptablesCmdHandler(forcedProtocol ...netutils.Proto) *iptables.IPTables {
+
+	var protocol netutils.Proto
+	if len(forcedProtocol) == 0 {
+		if nrc.isIpv6 {
+			protocol = netutils.V6
+		} else {
+			protocol = netutils.V4
+		}
 	} else {
-		return iptables.NewWithProtocol(iptables.ProtocolIPv4)
+		protocol = forcedProtocol[0]
 	}
+
+	handler, err := iptables.NewWithProtocol(iptables.Protocol(protocol))
+	if err != nil {
+		glog.Fatal("Failed create iptables handler: %s", err.Error())
+	}
+	return handler
+}
+
+func (nrc *NetworkRoutingController) enableIptables(initial netutils.IpTableManipulationType) error {
+	var err error = nil
+
+	// Handle Pod egress masquerading configuration
+	for _, protocol := range netutils.UsedTcpProtocols {
+		if err == nil && nrc.enablePodEgress {
+			err = nrc.createPodEgressRule(protocol, initial)
+		} else if err == nil {
+			err = nrc.deletePodEgressRule(protocol)
+		}
+
+		if err != nil {
+			glog.Errorf("Error applying pod egress: %s", err.Error())
+		}
+	}
+
+	if nrc.isIpv6 {
+		if err = nrc.EnableBgpSNAT(initial); err != nil {
+			fmt.Errorf("Failed to setup SNAT for bgp %s", err)
+		}
+	}
+
+	return err
+}
+
+func (nrc *NetworkRoutingController) EnableBgpSNAT(action netutils.IpTableManipulationType) error {
+	return nrc.ipm.CreateIpTablesRuleWithChain(netutils.V6, "nat", CHAIN_BGP_EGRESS_RULE, action, []string{"POSTROUTING"}, true, netutils.IpTablesRuleListType{
+		&netutils.IpTablesRuleType{"-m", "set", "--match-set", nodeAddrsIPSetName, "dst", "-p", "tcp", "--dport", fmt.Sprint(nrc.bgpPort), "-j", netutils.CHAIN_KUBE_SNAT_TARGET},
+		&netutils.IpTablesRuleType{"-m", "set", "!", "--match-set", nodeAddrsIPSetName, "dst", "-p", "tcp", "--dport", fmt.Sprint(nrc.bgpPort), "-j", netutils.CHAIN_KUBE_SNAT_TARGET},
+	})
 }
 
 // ensure there is rule in filter table and FORWARD chain to permit in/out traffic from pods
 // this rules will be appended so that any iptables rules for network policies will take
 // precedence
 func (nrc *NetworkRoutingController) enableForwarding() error {
+	return nrc.ipm.BothTCPProtocolsWrapperNoArg(nrc._enableForwarding)
+}
 
-	iptablesCmdHandler, _ := nrc.newIptablesCmdHandler()
+func (nrc *NetworkRoutingController) _enableForwarding(iptablesCmdHandler *iptables.IPTables, protocol netutils.Proto) error {
 
 	comment := "allow outbound traffic from pods"
 	args := []string{"-m", "comment", "--comment", comment, "-i", "kube-bridge", "-j", "ACCEPT"}
@@ -711,21 +728,14 @@ func (nrc *NetworkRoutingController) startBgpServer() error {
 		nrc.pathPrependCount = uint8(repeatN)
 	}
 
+	if !utils.CheckForElementInArray(nrc.nodeSubnet.IP.String(), nrc.localAddressList) {
+		nrc.localAddressList = append(nrc.localAddressList, nrc.nodeSubnet.IP.String())
+	}
+
 	nrc.bgpServer = gobgp.NewBgpServer()
 	go nrc.bgpServer.Serve()
 
-	g := bgpapi.NewGrpcServer(nrc.bgpServer, nrc.nodeIP.String()+":50051"+","+"127.0.0.1:50051")
-	go g.Serve()
-
-	var localAddressList []string
-
-	if ipv4IsEnabled() {
-		localAddressList = append(localAddressList, nrc.localAddressList...)
-	}
-
-	if ipv6IsEnabled() {
-		localAddressList = append(localAddressList, "::1")
-	}
+	localAddressList := nrc.localAddressList
 
 	global := &config.Global{
 		Config: config.GlobalConfig{
@@ -736,11 +746,14 @@ func (nrc *NetworkRoutingController) startBgpServer() error {
 		},
 	}
 
+	go nrc.watchBgpUpdates()
+
 	if err := nrc.bgpServer.Start(global); err != nil {
 		return errors.New("Failed to start BGP server due to : " + err.Error())
 	}
 
-	go nrc.watchBgpUpdates()
+	g := bgpapi.NewGrpcServer(nrc.bgpServer, netutils.NewIP(nrc.nodeIP).ToStringWithPort("50051")+","+"127.0.0.1:50051")
+	go g.Serve()
 
 	// If the global routing peer is configured then peer with it
 	// else attempt to get peers from node specific BGP annotations.
@@ -874,13 +887,9 @@ func NewNetworkRoutingController(clientset kubernetes.Interface,
 	nrc.nodeIP = nodeIP
 	nrc.isIpv6 = nodeIP.To4() == nil
 
-	if kubeRouterConfig.RouterId != "" {
-		nrc.routerId = kubeRouterConfig.RouterId
-	} else {
-		if nrc.isIpv6 {
-			return nil, errors.New("Router-id must be specified in ipv6 operation")
-		}
-		nrc.routerId = nrc.nodeIP.String()
+	bgpLocalAddressListAnnotation, _ := node.ObjectMeta.Annotations[routerID]
+	if "" == nrc.setRouterId(bgpLocalAddressListAnnotation, kubeRouterConfig.RouterId, nrc.nodeIP.String()) && nrc.isIpv6 {
+		return nil, errors.New("Router-id must be specified in ipv6 operation")
 	}
 
 	// lets start with assumption we hace necessary IAM creds to access EC2 api
@@ -896,17 +905,17 @@ func NewNetworkRoutingController(clientset kubernetes.Interface,
 		}
 	}
 
-	nrc.ipSetHandler, err = utils.NewIPSet(nrc.isIpv6)
+	nrc.ipSetHandler, err = netutils.NewIPSet()
 	if err != nil {
 		return nil, err
 	}
 
-	_, err = nrc.ipSetHandler.Create(podSubnetsIPSetName, utils.TypeHashNet, utils.OptionTimeout, "0")
+	_, err = nrc.ipSetHandler.Create(podSubnetsIPSetName, netutils.TypeHashNet, netutils.OptionTimeout, "0")
 	if err != nil {
 		return nil, err
 	}
 
-	_, err = nrc.ipSetHandler.Create(nodeAddrsIPSetName, utils.TypeHashIP, utils.OptionTimeout, "0")
+	_, err = nrc.ipSetHandler.Create(nodeAddrsIPSetName, netutils.TypeHashIP, netutils.OptionTimeout, "0")
 	if err != nil {
 		return nil, err
 	}
@@ -961,7 +970,7 @@ func NewNetworkRoutingController(clientset kubernetes.Interface,
 		return nil, fmt.Errorf("Error processing Global Peer Router configs: %s", err)
 	}
 
-	nrc.nodeSubnet, nrc.nodeInterface, err = getNodeSubnet(nodeIP)
+	nrc.nodeSubnet, nrc.nodeInterface, err = SearchForBiggerPrefix(nrc.nodeIP)
 	if err != nil {
 		return nil, errors.New("Failed find the subnet of the node IP and interface on" +
 			"which its configured: " + err.Error())
@@ -990,6 +999,8 @@ func NewNetworkRoutingController(clientset kubernetes.Interface,
 
 	nrc.nodeLister = nodeInformer.GetIndexer()
 	nrc.NodeEventHandler = nrc.newNodeEventHandler()
+
+	nrc.ipm = netutils.NewIpTablesManager(nrc.localAddressList, podEgressObsoleteChains)
 
 	return &nrc, nil
 }

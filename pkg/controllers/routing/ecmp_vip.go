@@ -6,8 +6,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/cloudnativelabs/kube-router/pkg/utils/net-tools"
 	"github.com/golang/glog"
-	"github.com/osrg/gobgp/packet/bgp"
 	"github.com/osrg/gobgp/table"
 	v1core "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/cache"
@@ -16,28 +16,22 @@ import (
 
 // bgpAdvertiseVIP advertises the service vip (cluster ip or load balancer ip or external IP) the configured peers
 func (nrc *NetworkRoutingController) bgpAdvertiseVIP(vip string) error {
+	ip := netutils.NewIP(vip)
+	node := netutils.NewIP(nrc.nodeIP)
 
-	attrs := []bgp.PathAttributeInterface{
-		bgp.NewPathAttributeOrigin(0),
-		bgp.NewPathAttributeNextHop(nrc.nodeIP.String()),
-	}
-
-	glog.V(2).Infof("Advertising route: '%s/%s via %s' to peers", vip, strconv.Itoa(32), nrc.nodeIP.String())
-
-	_, err := nrc.bgpServer.AddPath("", []*table.Path{table.NewPath(nil, bgp.NewIPAddrPrefix(uint8(32),
-		vip), false, attrs, time.Now(), false)})
+	glog.V(2).Infof("Advertising route: '%s via %s' to peers", ip.ToCIDR(), node.ToString())
+	_, err := nrc.bgpServer.AddPath("", []*table.Path{table.NewPath(nil, ip.ToBgpPrefix(), false, getPathAttributes(ip, node), time.Now(), false)})
 
 	return err
 }
 
 // bgpWithdrawVIP  unadvertises the service vip
 func (nrc *NetworkRoutingController) bgpWithdrawVIP(vip string) error {
-	glog.V(2).Infof("Withdrawing route: '%s/%s via %s' to peers", vip, strconv.Itoa(32), nrc.nodeIP.String())
+	ip := netutils.NewIP(vip)
+	node := netutils.NewIP(nrc.nodeIP)
 
-	pathList := []*table.Path{table.NewPath(nil, bgp.NewIPAddrPrefix(uint8(32),
-		vip), true, nil, time.Now(), false)}
-
-	err := nrc.bgpServer.DeletePath([]byte(nil), 0, "", pathList)
+	glog.V(2).Infof("Withdrawing route: '%s via %s' to peers", ip.ToCIDR(), node.ToString())
+	err := nrc.bgpServer.DeletePath([]byte(nil), 0, "", []*table.Path{table.NewPath(nil, ip.ToBgpPrefix(), true, getPathAttributes(ip, node), time.Now(), false)})
 
 	return err
 }
@@ -161,7 +155,7 @@ func (nrc *NetworkRoutingController) newEndpointsEventHandler() cache.ResourceEv
 }
 
 // OnEndpointsAdd handles endpoint add events from apiserver
-// This method calls OnEndpointsUpdate with the addition of updating BGP export policies
+// This method calls OnEndpointUpdate with the addition of updating BGP export policies
 // Calling addExportPolicies here covers the edge case where addExportPolicies fails in
 // OnServiceUpdate because the corresponding Endpoint resource for the
 // Service was not created yet.
@@ -179,7 +173,7 @@ func (nrc *NetworkRoutingController) OnEndpointsAdd(obj interface{}) {
 	nrc.OnEndpointsUpdate(obj)
 }
 
-// OnEndpointsUpdate handles the endpoint updates from the kubernetes API server
+// OnEndpointUpdate handles the endpoint updates from the kubernetes API server
 func (nrc *NetworkRoutingController) OnEndpointsUpdate(obj interface{}) {
 	ep, ok := obj.(*v1core.Endpoints)
 	if !ok {

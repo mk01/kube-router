@@ -21,6 +21,7 @@ import (
 	"github.com/golang/glog"
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/cloudnativelabs/kube-router/pkg/utils/net-tools"
 	api "k8s.io/api/core/v1"
 	apiextensions "k8s.io/api/extensions/v1beta1"
 	networking "k8s.io/api/networking/v1"
@@ -31,6 +32,8 @@ import (
 )
 
 const (
+	CONTROLLER_NAME = "Policy controller"
+
 	networkPolicyAnnotation      = "net.beta.kubernetes.io/network-policy"
 	kubePodFirewallChainPrefix   = "KUBE-POD-FW-"
 	kubeNetworkPolicyChainPrefix = "KUBE-NWPLCY-"
@@ -61,7 +64,7 @@ type NetworkPolicyController struct {
 
 	// list of all active network policies expressed as networkPolicyInfo
 	networkPoliciesInfo *[]networkPolicyInfo
-	ipSetHandler        *utils.IPSet
+	ipSetHandler        *netutils.IPSet
 
 	podLister cache.Indexer
 	npLister  cache.Indexer
@@ -132,8 +135,12 @@ func newProtocolAndPort(protocol string, port *intstr.IntOrString) protocolAndPo
 	return protocolAndPort{protocol: protocol, port: strPort}
 }
 
+func (npc *NetworkPolicyController) GetName() string {
+	return CONTROLLER_NAME
+}
+
 // Run runs forver till we receive notification on stopCh
-func (npc *NetworkPolicyController) Run(healthChan chan<- *healthcheck.ControllerHeartbeat, stopCh <-chan struct{}, wg *sync.WaitGroup) {
+func (npc *NetworkPolicyController) Run(healthChan chan<- *healthcheck.ControllerHeartbeat, stopCh <-chan struct{}, wg *sync.WaitGroup) error {
 	t := time.NewTicker(npc.syncPeriod)
 	defer t.Stop()
 	defer wg.Done()
@@ -145,7 +152,7 @@ func (npc *NetworkPolicyController) Run(healthChan chan<- *healthcheck.Controlle
 		select {
 		case <-stopCh:
 			glog.Info("Shutting down network policies controller")
-			return
+			return nil
 		default:
 		}
 
@@ -161,10 +168,11 @@ func (npc *NetworkPolicyController) Run(healthChan chan<- *healthcheck.Controlle
 		select {
 		case <-stopCh:
 			glog.Infof("Shutting down network policies controller")
-			return
+			return nil
 		case <-t.C:
 		}
 	}
+	return nil
 }
 
 // OnPodUpdate handles updates to pods from the Kubernetes api server
@@ -297,14 +305,14 @@ func (npc *NetworkPolicyController) syncNetworkPolicyChains(version string) (map
 
 		// create a ipset for all destination pod ip's matched by the policy spec PodSelector
 		targetDestPodIpSetName := policyDestinationPodIpSetName(policy.namespace, policy.name)
-		targetDestPodIpSet, err := npc.ipSetHandler.Create(targetDestPodIpSetName, utils.TypeHashIP, utils.OptionTimeout, "0")
+		targetDestPodIpSet, err := npc.ipSetHandler.Create(targetDestPodIpSetName, netutils.TypeHashIP, netutils.OptionTimeout, "0")
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to create ipset: %s", err.Error())
 		}
 
 		// create a ipset for all source pod ip's matched by the policy spec PodSelector
 		targetSourcePodIpSetName := policySourcePodIpSetName(policy.namespace, policy.name)
-		targetSourcePodIpSet, err := npc.ipSetHandler.Create(targetSourcePodIpSetName, utils.TypeHashIP, utils.OptionTimeout, "0")
+		targetSourcePodIpSet, err := npc.ipSetHandler.Create(targetSourcePodIpSetName, netutils.TypeHashIP, netutils.OptionTimeout, "0")
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to create ipset: %s", err.Error())
 		}
@@ -317,11 +325,11 @@ func (npc *NetworkPolicyController) syncNetworkPolicyChains(version string) (map
 			currnetPodIps = append(currnetPodIps, ip)
 		}
 
-		err = targetSourcePodIpSet.Refresh(currnetPodIps, utils.OptionTimeout, "0")
+		err = targetSourcePodIpSet.Refresh(currnetPodIps, netutils.OptionTimeout, "0")
 		if err != nil {
 			glog.Errorf("failed to refresh targetSourcePodIpSet: " + err.Error())
 		}
-		err = targetDestPodIpSet.Refresh(currnetPodIps, utils.OptionTimeout, "0")
+		err = targetDestPodIpSet.Refresh(currnetPodIps, netutils.OptionTimeout, "0")
 		if err != nil {
 			glog.Errorf("failed to refresh targetDestPodIpSet: " + err.Error())
 		}
@@ -364,7 +372,7 @@ func (npc *NetworkPolicyController) processIngressRules(policy networkPolicyInfo
 
 		if len(ingressRule.srcPods) != 0 {
 			srcPodIpSetName := policyIndexedSourcePodIpSetName(policy.namespace, policy.name, i)
-			srcPodIpSet, err := npc.ipSetHandler.Create(srcPodIpSetName, utils.TypeHashIP, utils.OptionTimeout, "0")
+			srcPodIpSet, err := npc.ipSetHandler.Create(srcPodIpSetName, netutils.TypeHashIP, netutils.OptionTimeout, "0")
 			if err != nil {
 				return fmt.Errorf("failed to create ipset: %s", err.Error())
 			}
@@ -375,7 +383,7 @@ func (npc *NetworkPolicyController) processIngressRules(policy networkPolicyInfo
 			for _, pod := range ingressRule.srcPods {
 				ingressRuleSrcPodIps = append(ingressRuleSrcPodIps, pod.ip)
 			}
-			err = srcPodIpSet.Refresh(ingressRuleSrcPodIps, utils.OptionTimeout, "0")
+			err = srcPodIpSet.Refresh(ingressRuleSrcPodIps, netutils.OptionTimeout, "0")
 			if err != nil {
 				glog.Errorf("failed to refresh srcPodIpSet: " + err.Error())
 			}
@@ -457,7 +465,7 @@ func (npc *NetworkPolicyController) processIngressRules(policy networkPolicyInfo
 
 		if len(ingressRule.srcIPBlocks) != 0 {
 			srcIpBlockIpSetName := policyIndexedSourceIpBlockIpSetName(policy.namespace, policy.name, i)
-			srcIpBlockIpSet, err := npc.ipSetHandler.Create(srcIpBlockIpSetName, utils.TypeHashNet, utils.OptionTimeout, "0")
+			srcIpBlockIpSet, err := npc.ipSetHandler.Create(srcIpBlockIpSetName, netutils.TypeHashNet, netutils.OptionTimeout, "0")
 			if err != nil {
 				return fmt.Errorf("failed to create ipset: %s", err.Error())
 			}
@@ -527,7 +535,7 @@ func (npc *NetworkPolicyController) processEgressRules(policy networkPolicyInfo,
 
 		if len(egressRule.dstPods) != 0 {
 			dstPodIpSetName := policyIndexedDestinationPodIpSetName(policy.namespace, policy.name, i)
-			dstPodIpSet, err := npc.ipSetHandler.Create(dstPodIpSetName, utils.TypeHashIP, utils.OptionTimeout, "0")
+			dstPodIpSet, err := npc.ipSetHandler.Create(dstPodIpSetName, netutils.TypeHashIP, netutils.OptionTimeout, "0")
 			if err != nil {
 				return fmt.Errorf("failed to create ipset: %s", err.Error())
 			}
@@ -538,7 +546,7 @@ func (npc *NetworkPolicyController) processEgressRules(policy networkPolicyInfo,
 			for _, pod := range egressRule.dstPods {
 				egressRuleDstPodIps = append(egressRuleDstPodIps, pod.ip)
 			}
-			dstPodIpSet.Refresh(egressRuleDstPodIps, utils.OptionTimeout, "0")
+			dstPodIpSet.Refresh(egressRuleDstPodIps, netutils.OptionTimeout, "0")
 
 			if len(egressRule.ports) != 0 {
 				// case where 'ports' details and 'from' details specified in the egress rule
@@ -616,7 +624,7 @@ func (npc *NetworkPolicyController) processEgressRules(policy networkPolicyInfo,
 		}
 		if len(egressRule.dstIPBlocks) != 0 {
 			dstIpBlockIpSetName := policyIndexedDestinationIpBlockIpSetName(policy.namespace, policy.name, i)
-			dstIpBlockIpSet, err := npc.ipSetHandler.Create(dstIpBlockIpSetName, utils.TypeHashNet, utils.OptionTimeout, "0")
+			dstIpBlockIpSet, err := npc.ipSetHandler.Create(dstIpBlockIpSetName, netutils.TypeHashNet, netutils.OptionTimeout, "0")
 			if err != nil {
 				return fmt.Errorf("failed to create ipset: %s", err.Error())
 			}
@@ -901,13 +909,13 @@ func cleanupStaleRules(activePolicyChains, activePodFwChains, activePolicyIPSets
 
 	cleanupPodFwChains := make([]string, 0)
 	cleanupPolicyChains := make([]string, 0)
-	cleanupPolicyIPSets := make([]*utils.Set, 0)
+	cleanupPolicyIPSets := make([]*netutils.Set, 0)
 
 	iptablesCmdHandler, err := iptables.New()
 	if err != nil {
 		glog.Fatalf("failed to initialize iptables command executor due to %s", err.Error())
 	}
-	ipsets, err := utils.NewIPSet(false)
+	ipsets, err := netutils.NewIPSet()
 	if err != nil {
 		glog.Fatalf("failed to create ipsets command executor due to %s", err.Error())
 	}
@@ -1324,15 +1332,15 @@ func (npc *NetworkPolicyController) evalIPBlockPeer(peer networking.NetworkPolic
 	ipBlock := make([][]string, 0)
 	if peer.PodSelector == nil && peer.NamespaceSelector == nil && peer.IPBlock != nil {
 		if cidr := peer.IPBlock.CIDR; strings.HasSuffix(cidr, "/0") {
-			ipBlock = append(ipBlock, []string{"0.0.0.0/1", utils.OptionTimeout, "0"}, []string{"128.0.0.0/1", utils.OptionTimeout, "0"})
+			ipBlock = append(ipBlock, []string{"0.0.0.0/1", netutils.OptionTimeout, "0"}, []string{"128.0.0.0/1", netutils.OptionTimeout, "0"})
 		} else {
-			ipBlock = append(ipBlock, []string{cidr, utils.OptionTimeout, "0"})
+			ipBlock = append(ipBlock, []string{cidr, netutils.OptionTimeout, "0"})
 		}
 		for _, except := range peer.IPBlock.Except {
 			if strings.HasSuffix(except, "/0") {
-				ipBlock = append(ipBlock, []string{"0.0.0.0/1", utils.OptionTimeout, "0", utils.OptionNoMatch}, []string{"128.0.0.0/1", utils.OptionTimeout, "0", utils.OptionNoMatch})
+				ipBlock = append(ipBlock, []string{"0.0.0.0/1", netutils.OptionTimeout, "0", netutils.OptionNoMatch}, []string{"128.0.0.0/1", netutils.OptionTimeout, "0", netutils.OptionNoMatch})
 			} else {
-				ipBlock = append(ipBlock, []string{except, utils.OptionTimeout, "0", utils.OptionNoMatch})
+				ipBlock = append(ipBlock, []string{except, netutils.OptionTimeout, "0", netutils.OptionNoMatch})
 			}
 		}
 	}
@@ -1524,7 +1532,7 @@ func (npc *NetworkPolicyController) Cleanup() {
 	}
 
 	// delete all ipsets
-	ipset, err := utils.NewIPSet(false)
+	ipset, err := netutils.NewIPSet()
 	if err != nil {
 		glog.Errorf("Failed to clean up ipsets: " + err.Error())
 	}
@@ -1629,7 +1637,7 @@ func NewNetworkPolicyController(clientset kubernetes.Interface,
 	}
 	npc.nodeIP = nodeIP
 
-	ipset, err := utils.NewIPSet(false)
+	ipset, err := netutils.NewIPSet()
 	if err != nil {
 		return nil, err
 	}

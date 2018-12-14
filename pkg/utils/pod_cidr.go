@@ -17,8 +17,7 @@ const (
 )
 
 // GetPodCidrFromCniSpec gets pod CIDR allocated to the node from CNI spec file and returns it
-func GetPodCidrFromCniSpec(cniConfFilePath string) (net.IPNet, error) {
-	var podCidr net.IPNet
+func GetPodCidrFromCniSpec(cniConfFilePath string) (*net.IPNet, error) {
 	var err error
 	var ipamConfig *allocator.IPAMConfig
 
@@ -26,13 +25,13 @@ func GetPodCidrFromCniSpec(cniConfFilePath string) (net.IPNet, error) {
 		var confList *libcni.NetworkConfigList
 		confList, err = libcni.ConfListFromFile(cniConfFilePath)
 		if err != nil {
-			return net.IPNet{}, fmt.Errorf("Failed to load CNI config list file: %s", err.Error())
+			return nil, fmt.Errorf("Failed to load CNI config list file: %s", err.Error())
 		}
 		for _, conf := range confList.Plugins {
 			if conf.Network.IPAM.Type != "" {
 				ipamConfig, _, err = allocator.LoadIPAMConfig(conf.Bytes, "")
 				if err != nil {
-					return net.IPNet{}, fmt.Errorf("Failed to get IPAM details from the CNI conf file: %s", err.Error())
+					return nil, fmt.Errorf("Failed to get IPAM details from the CNI conf file: %s", err.Error())
 				}
 				break
 			}
@@ -40,15 +39,15 @@ func GetPodCidrFromCniSpec(cniConfFilePath string) (net.IPNet, error) {
 	} else {
 		netconfig, err := libcni.ConfFromFile(cniConfFilePath)
 		if err != nil {
-			return net.IPNet{}, fmt.Errorf("Failed to load CNI conf file: %s", err.Error())
+			return nil, fmt.Errorf("Failed to load CNI conf file: %s", err.Error())
 		}
 		ipamConfig, _, err = allocator.LoadIPAMConfig(netconfig.Bytes, "")
 		if err != nil {
-			return net.IPNet{}, fmt.Errorf("Failed to get IPAM details from the CNI conf file: %s", err.Error())
+			return nil, fmt.Errorf("Failed to get IPAM details from the CNI conf file: %s", err.Error())
 		}
 	}
-	podCidr = net.IPNet(ipamConfig.Subnet)
-	return podCidr, nil
+	ipn := net.IPNet(ipamConfig.Subnet)
+	return &ipn, nil
 }
 
 // InsertPodCidrInCniSpec inserts the pod CIDR allocated to the node by kubernetes controlller manager
@@ -105,24 +104,24 @@ func InsertPodCidrInCniSpec(cniConfFilePath string, cidr string) error {
 }
 
 // GetPodCidrFromNodeSpec reads the pod CIDR allocated to the node from API node object and returns it
-func GetPodCidrFromNodeSpec(clientset kubernetes.Interface, hostnameOverride string) (string, error) {
+func GetPodCidrFromNodeSpec(clientset kubernetes.Interface, hostnameOverride string) (*net.IPNet, error) {
 	node, err := GetNodeObject(clientset, hostnameOverride)
 	if err != nil {
-		return "", fmt.Errorf("Failed to get pod CIDR allocated for the node due to: " + err.Error())
+		return &net.IPNet{}, fmt.Errorf("Failed to get pod CIDR allocated for the node due to: " + err.Error())
 	}
 
+	var ipNet *net.IPNet
 	if cidr, ok := node.Annotations[podCIDRAnnotation]; ok {
-		_, _, err = net.ParseCIDR(cidr)
-		if err != nil {
-			return "", fmt.Errorf("error parsing pod CIDR in node annotation: %v", err)
+		if _, ipNet, err = net.ParseCIDR(cidr); err != nil {
+			return &net.IPNet{}, fmt.Errorf("error parsing pod CIDR in node annotation: %v", err.Error())
 		}
 
-		return cidr, nil
+		return ipNet, nil
 	}
 
-	if node.Spec.PodCIDR == "" {
-		return "", fmt.Errorf("node.Spec.PodCIDR not set for node: %v", node.Name)
+	if _, ipNet, err = net.ParseCIDR(node.Spec.PodCIDR); err != nil {
+		return &net.IPNet{}, fmt.Errorf("node.Spec.PodCIDR not set for node: %v", node.Name)
 	}
 
-	return node.Spec.PodCIDR, nil
+	return ipNet, nil
 }
