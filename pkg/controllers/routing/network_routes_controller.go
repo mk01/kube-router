@@ -34,6 +34,8 @@ import (
 )
 
 const (
+	CONTROLLER_NAME = "Routes controller"
+
 	IFACE_NOT_FOUND = "Link not found"
 
 	customRouteTableID   = "77"
@@ -117,9 +119,12 @@ type NetworkRoutingController struct {
 	EndpointsEventHandler cache.ResourceEventHandler
 }
 
+func (nrc *NetworkRoutingController) GetName() string {
+	return CONTROLLER_NAME
+}
+
 // Run runs forever until we are notified on stop channel
-func (nrc *NetworkRoutingController) Run(healthChan chan<- *healthcheck.ControllerHeartbeat, stopCh <-chan struct{}, wg *sync.WaitGroup) {
-	var err error
+func (nrc *NetworkRoutingController) Run(healthChan chan<- *healthcheck.ControllerHeartbeat, stopCh <-chan struct{}, wg *sync.WaitGroup) (err error) {
 	if nrc.enableCNI {
 		nrc.updateCNIConfig()
 	}
@@ -229,7 +234,7 @@ func (nrc *NetworkRoutingController) Run(healthChan chan<- *healthcheck.Controll
 			select {
 			case <-stopCh:
 				glog.Infof("Shutting down network routes controller")
-				return
+				return err
 			case <-t.C:
 				glog.Infof("Retrying start of node BGP server")
 				continue
@@ -250,7 +255,7 @@ func (nrc *NetworkRoutingController) Run(healthChan chan<- *healthcheck.Controll
 		select {
 		case <-stopCh:
 			glog.Infof("Shutting down network routes controller")
-			return
+			return err
 		default:
 		}
 
@@ -304,10 +309,11 @@ func (nrc *NetworkRoutingController) Run(healthChan chan<- *healthcheck.Controll
 		select {
 		case <-stopCh:
 			glog.Infof("Shutting down network routes controller")
-			return
+			return err
 		case <-t.C:
 		}
 	}
+	return err
 }
 
 func (nrc *NetworkRoutingController) updateCNIConfig() {
@@ -526,7 +532,7 @@ func (nrc *NetworkRoutingController) Cleanup() {
 	}
 
 	// delete all ipsets created by kube-router
-	ipset, err := utils.NewIPSet(nrc.isIpv6)
+	ipset, err := utils.NewIPSet()
 	if err != nil {
 		glog.Errorf("Failed to clean up ipsets: " + err.Error())
 	}
@@ -904,7 +910,7 @@ func NewNetworkRoutingController(clientset kubernetes.Interface,
 		}
 	}
 
-	nrc.ipSetHandler, err = utils.NewIPSet(nrc.isIpv6)
+	nrc.ipSetHandler, err = utils.NewIPSet()
 	if err != nil {
 		return nil, err
 	}

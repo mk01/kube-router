@@ -9,6 +9,7 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/cloudnativelabs/kube-router/pkg/controllers"
 	"github.com/cloudnativelabs/kube-router/pkg/controllers/netpol"
 	"github.com/cloudnativelabs/kube-router/pkg/controllers/proxy"
 	"github.com/cloudnativelabs/kube-router/pkg/controllers/routing"
@@ -73,6 +74,12 @@ func CleanupConfigAndExit() {
 	nrc.Cleanup()
 }
 
+func (kr *KubeRouter) spawnController(healthCh chan *healthcheck.ControllerHeartbeat, stopCh chan struct{}, wg *sync.WaitGroup, cnt controllers.Controller) {
+	if err := cnt.Run(healthCh, stopCh, wg); err != nil {
+		glog.Errorf("Can't start controller: %s", err.Error())
+	}
+}
+
 // Run starts the controllers and waits forever till we get SIGINT or SIGTERM
 func (kr *KubeRouter) Run() error {
 	var err error
@@ -118,7 +125,7 @@ func (kr *KubeRouter) Run() error {
 			return errors.New("Failed to create metrics controller: " + err.Error())
 		}
 		wg.Add(1)
-		go mc.Run(healthChan, stopCh, &wg)
+		go kr.spawnController(healthChan, stopCh, &wg, mc)
 
 	} else if kr.Config.MetricsPort > 65535 {
 		glog.Errorf("Metrics port must be over 0 and under 65535, given port: %d", kr.Config.MetricsPort)
@@ -139,7 +146,7 @@ func (kr *KubeRouter) Run() error {
 		npInformer.AddEventHandler(npc.NetworkPolicyEventHandler)
 
 		wg.Add(1)
-		go npc.Run(healthChan, stopCh, &wg)
+		go kr.spawnController(healthChan, stopCh, &wg, npc)
 	}
 
 	if kr.Config.RunRouter {
@@ -153,7 +160,7 @@ func (kr *KubeRouter) Run() error {
 		epInformer.AddEventHandler(nrc.EndpointsEventHandler)
 
 		wg.Add(1)
-		go nrc.Run(healthChan, stopCh, &wg)
+		go kr.spawnController(healthChan, stopCh, &wg, nrc)
 	}
 
 	if kr.Config.RunServiceProxy {
@@ -167,7 +174,7 @@ func (kr *KubeRouter) Run() error {
 		epInformer.AddEventHandler(nsc.EndpointsEventHandler)
 
 		wg.Add(1)
-		go nsc.Run(healthChan, stopCh, &wg)
+		go kr.spawnController(healthChan, stopCh, &wg, nsc)
 	}
 
 	// Handle SIGINT and SIGTERM

@@ -31,6 +31,8 @@ import (
 )
 
 const (
+	CONTROLLER_NAME = "Policy controller"
+
 	networkPolicyAnnotation      = "net.beta.kubernetes.io/network-policy"
 	kubePodFirewallChainPrefix   = "KUBE-POD-FW-"
 	kubeNetworkPolicyChainPrefix = "KUBE-NWPLCY-"
@@ -132,8 +134,12 @@ func newProtocolAndPort(protocol string, port *intstr.IntOrString) protocolAndPo
 	return protocolAndPort{protocol: protocol, port: strPort}
 }
 
+func (npc *NetworkPolicyController) GetName() string {
+	return CONTROLLER_NAME
+}
+
 // Run runs forver till we receive notification on stopCh
-func (npc *NetworkPolicyController) Run(healthChan chan<- *healthcheck.ControllerHeartbeat, stopCh <-chan struct{}, wg *sync.WaitGroup) {
+func (npc *NetworkPolicyController) Run(healthChan chan<- *healthcheck.ControllerHeartbeat, stopCh <-chan struct{}, wg *sync.WaitGroup) error {
 	t := time.NewTicker(npc.syncPeriod)
 	defer t.Stop()
 	defer wg.Done()
@@ -145,7 +151,7 @@ func (npc *NetworkPolicyController) Run(healthChan chan<- *healthcheck.Controlle
 		select {
 		case <-stopCh:
 			glog.Info("Shutting down network policies controller")
-			return
+			return nil
 		default:
 		}
 
@@ -161,10 +167,11 @@ func (npc *NetworkPolicyController) Run(healthChan chan<- *healthcheck.Controlle
 		select {
 		case <-stopCh:
 			glog.Infof("Shutting down network policies controller")
-			return
+			return nil
 		case <-t.C:
 		}
 	}
+	return nil
 }
 
 // OnPodUpdate handles updates to pods from the Kubernetes api server
@@ -907,7 +914,7 @@ func cleanupStaleRules(activePolicyChains, activePodFwChains, activePolicyIPSets
 	if err != nil {
 		glog.Fatalf("failed to initialize iptables command executor due to %s", err.Error())
 	}
-	ipsets, err := utils.NewIPSet(false)
+	ipsets, err := utils.NewIPSet()
 	if err != nil {
 		glog.Fatalf("failed to create ipsets command executor due to %s", err.Error())
 	}
@@ -1524,7 +1531,7 @@ func (npc *NetworkPolicyController) Cleanup() {
 	}
 
 	// delete all ipsets
-	ipset, err := utils.NewIPSet(false)
+	ipset, err := utils.NewIPSet()
 	if err != nil {
 		glog.Errorf("Failed to clean up ipsets: " + err.Error())
 	}
@@ -1629,7 +1636,7 @@ func NewNetworkPolicyController(clientset kubernetes.Interface,
 	}
 	npc.nodeIP = nodeIP
 
-	ipset, err := utils.NewIPSet(false)
+	ipset, err := utils.NewIPSet()
 	if err != nil {
 		return nil, err
 	}
