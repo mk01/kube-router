@@ -14,14 +14,16 @@ import (
 	"github.com/golang/glog"
 	"github.com/pkg/errors"
 	"regexp"
-	"sync/atomic"
 )
 
 func (nsc *NetworkServicesController) newServiceObject(oso *serviceObject) *serviceObject {
 	var so = new(serviceObject)
 	so.meta = oso.meta
-	used := map[*endpointInfo]bool{}
-	so.ksvc = &KubeService{Service: new(libipvs.Service), ln: nsc.ln, used: &used, lt: LINKED_SERVICE_NOTLINKED}
+	so.ksvc = &KubeService{Service: &libipvs.Service{}, ln: nsc.ln}//, lt: LINKED_SERVICE_NOTLINKED}
+	//so.ksvc.AtomicUsage.funcOnZero = func() {
+	//	so.linkedServices[so.ksvc.lt].remove(so.ksvc)
+	//	so.ksvc.destroy()
+	//}
 	so.linkedServices = make(linkedServiceListMapType)
 	so.linkedServices.init()
 	so.info = new(serviceInfo)
@@ -71,23 +73,30 @@ func (so *serviceObject) deployLinkedService(deployF func(*kubeServiceArrayType,
 	for _, ip := range getIpF() {
 		deployF(&old, ip)
 	}
-	so.checkToDelete(&old, lt)
+
+	old.forEach(func(ks *KubeService) {
+		if so.linkedServices[lt].isPresent(ks) == -1 {
+			so.getEps().forEach(func(ep *endpointInfo) {
+				ep.detach(ks, SYNCH_NOT_FOUND)
+			})
+		}
+	})
 }
 
-func (so *serviceObject) checkToDelete(old *kubeServiceArrayType, lt linkedServiceType) {
-	for _, ks := range *old {
-		if !utils.CheckForElementInArray(ks, so.linkedServices[lt], ComparerKubeService) {
-			for _, ep := range *so.getEps() {
-				ep.detach(ks, SYNCH_NOT_FOUND)
-			}
-		}
+func (eps *endpointInfoMapType) forEach(f func(*endpointInfo)) {
+	for _, ep := range *eps {
+		f(ep)
 	}
 }
 
+func (eps *endpointInfoMapType) Size() int {
+	return len(*eps)
+}
+
 func (so *serviceObject) updateIpvs(changed ...synchChangeType) {
-	for _, ep := range *so.endpoints {
+	so.endpoints.forEach(func(ep *endpointInfo) {
 		if ep.Weight == 0 {
-			continue
+			return
 		}
 		ch := ep.change.mergeChange(changed...).mergeChange(so.meta.change)
 
@@ -98,17 +107,14 @@ func (so *serviceObject) updateIpvs(changed ...synchChangeType) {
 		if ch.CheckFor(SYNCH_NOT_FOUND) {
 			so.iterateOver(ep.detach, ch)
 		}
-	}
+	})
 }
 
 func (so *serviceObject) hasActiveEndpoints() bool {
-	return len(*so.getEps()) > 0
+	return so.getEps().Size() != 0
 }
 
-
 func (so *serviceObject) getEps() (eps *endpointInfoMapType) {
-	so.epLock.Lock()
-	defer so.epLock.Unlock()
 	return so.endpoints
 }
 
@@ -141,17 +147,25 @@ func (so *serviceObject) deployService(chng ...synchChangeType) {
 func (so *serviceObject) linkService(old *kubeServiceArrayType, ip *net.IPNet, isFWMark bool, lType linkedServiceType) {
 	var ksvc *KubeService
 	var err error
+	var create = true
 
-	if lType != LINKED_SERVICE_NOTLINKED {
-		ksvc = so.ksvc.clone(ip, isFWMark, lType, so.info)
+
+	//if lType != LINKED_SERVICE_NOTLINKED {
+	newksvc := so.ksvc.clone(ip, isFWMark, lType, so)
+	if i := old.isPresent(newksvc); i != -1 {
+		ksvc = (*old)[i]
+		ksvc.Service = newksvc.Service
+		create = false
 	} else {
-		ksvc = so.ksvc
+		ksvc = newksvc
 	}
+//}
+		/* else {
+		ksvc = so.ksvc
+	}*/
 
-	update := old.isPresent(ksvc) != -1
-
-	if err = ksvc.deploy(update); err != nil {
-		glog.Errorf("Failed deploying service " + err.Error())
+	if err = ksvc.deploy(create || so.meta.change.CheckFor(SYNCH_NEW)); err != nil {
+		glog.Errorf("Create: %v, failed %s, Object: %v\nService Object:",  err.Error(), so, old)
 		return
 	}
 
@@ -171,11 +185,12 @@ func (ep *endpointInfo) detach(ks *KubeService, update synchChangeType, fs ...po
 }
 
 func (ep *endpointInfo) attach(ks *KubeService, update synchChangeType, fs ...postActionFunctionType) {
-	if upd, err := ks.attachDestination(ep); err == nil && (ep.change.CheckFor(SYNCH_NEW) || !upd) {
+	if upd, err := ks.attachDestination(ep); err == nil && (ep.change.CheckFor(SYNCH_NEW) || ep.change.CheckFor(SYNCH_NEW) && !upd) {
 		for _, f := range fs {
 			f(ep, ks, NL_ADDR_ADD)
 		}
-		ep.lock()
+		ep.Lock(ep.String())
+		ks.Lock(ks.String())
 	}
 }
 
@@ -201,7 +216,7 @@ func (so *serviceObject) prepareDsr(ep *endpointInfo, ks *KubeService, la epActi
 	}
 
 	if err == nil {
-		if err = ks.ln.prepareEndpointForDsr(containerID, ep.Address, ks.Address.String(), fmt.Sprint(ks.Port), fmt.Sprint(ep.Port)); err != nil {
+		if err = ks.ln.prepareEndpointForDsr(containerID, ep.Address, ks.Address.String(), fmt.Sprint(ks.Port), fmt.Sprint(ep.Port), ks.Protocol.String()); err != nil {
 			err = errors.Errorf("Failed to prepare endpoint %s to do direct server return due to %s", ep.Address.String(), err.Error())
 		}
 	}
@@ -213,7 +228,6 @@ func (so *serviceObject) prepareDsr(ep *endpointInfo, ks *KubeService, la epActi
 
 func (so *serviceObject) destroy(ep *endpointInfo) {
 	so.epLock.Lock()
-	defer so.epLock.Unlock()
 
 	if ep.connTrack {
 		ep.purgeConntrackRecords()
@@ -223,26 +237,16 @@ func (so *serviceObject) destroy(ep *endpointInfo) {
 	delete(*so.endpoints, id)
 }
 
-func (ep *endpointInfo) lock() {
-	atomic.AddInt32(&ep.used, 1)
-}
-
-func (ep *endpointInfo) release() {
-	if atomic.AddInt32(&ep.used, -1) == 0 {
-		ep.so.destroy(ep)
-	}
-}
-
 func (so *serviceObject) iterateOver(f func(*KubeService, synchChangeType, ...postActionFunctionType), update synchChangeType, fs ...postActionFunctionType) {
-	for _, lk := range allEndpointTypes {
+	allEndpointTypes.ForEach(func(lk linkedServiceType) {
 		var fns = fs
 		if lk == LINKED_SERVICE_EXTERNALIP {
 			fns = append(fns, so.prepareDsr)
 		}
-		for _, ksvc := range *so.linkedServices[lk] {
+		so.linkedServices[lk].forEach(func(ksvc *KubeService) {
 			f(ksvc, update, fns...)
-		}
-	}
+		})
+	})
 }
 
 func (so *serviceObject) generateDestination(ip net.IP, port uint16) *libipvs.Destination {
@@ -293,9 +297,9 @@ func (so *serviceObject) setupRoutesForExternalIPForDSR(activeExternalIPs *map[s
 			}
 		}
 
-		if err := exec.Command("ip", inet, "route", "replace", eipStr, "dev", "kube-bridge", "table",
-			ROUTE_TABLE_EXTERNAL).Run(); err != nil {
-			glog.Error("Failed to add route for " + eipStr + " to custom route table for external IP's due to: " + err.Error())
+		if out, err := exec.Command(utils.GetPath("ip"), inet, "route", "replace", eipStr, "dev", "kube-bridge", "table",
+			ROUTE_TABLE_EXTERNAL).CombinedOutput(); err != nil {
+			glog.Error("Running command failed: " + string(out) + "\nAdding " + eipStr + " to custom route table for external IP's failed due to: " + err.Error())
 			continue
 		}
 	}

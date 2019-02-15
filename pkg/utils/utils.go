@@ -1,13 +1,21 @@
 package utils
 
 import (
-	"net"
 	"reflect"
 	"sync"
 
+	"github.com/golang/glog"
 	"github.com/google/go-cmp/cmp"
 	"hash/fnv"
+	"os/exec"
+	"strings"
+	"net"
 )
+
+type ApiTransaction struct {
+	Old interface{}
+	New interface{}
+}
 
 type ChannelLockType chan int
 
@@ -19,6 +27,25 @@ type ListenerFunc func(instance interface{})
 
 func (f ListenerFunc) OnUpdate(instance interface{}) {
 	f(instance)
+}
+
+type pathsToUtilsType map[string]string
+
+var pathsToUtils pathsToUtilsType
+
+func init() {
+	var err error
+	pathsToUtils = make(map[string]string)
+	for _, util := range []string{"ip", "ip6tables", "iptables", "ipset"} {
+		pathsToUtils[util], err = exec.LookPath(util)
+		if err != nil {
+			glog.Error("Utils: can't get path to " + util + " err: " + err.Error())
+		}
+	}
+}
+
+func GetPath(util string) string {
+	return pathsToUtils[util]
 }
 
 // reads only UP interfaces while completely excluding PtP and Loopback
@@ -72,21 +99,41 @@ func FindElementInArray(element interface{}, array interface{}, options ...cmp.O
 	return
 }
 
-func DoHash(input *[]byte) uint32 {
+func SymetricHasPrefix(a string, b string) bool {
+	if len(a)*len(b) == 0 {
+		return false
+	}
+	if len(a) > len(b) {
+		return strings.HasPrefix(a, b)
+	}
+	return strings.HasPrefix(b, a)
+}
+
+func DoHash(input string) uint32 {
 	h := fnv.New32a()
-	h.Write(*input)
+	h.Write([]byte(input))
 	return h.Sum32()
 }
 
+func DoHash64(input string) uint64 {
+	h := fnv.New64()
+	h.Write([]byte(input))
+	return h.Sum64()
+}
+
 func (cl *ChannelLockType) Lock() {
-	*cl <- 1
+	(*cl) <- 1
 }
 
 func (cl *ChannelLockType) Unlock() {
 	<-(*cl)
 }
 
-func NewChanLock() *ChannelLockType {
-	var ll = make(ChannelLockType, 1)
+func NewChanLock(arg ...int) *ChannelLockType {
+	capacity := 1
+	if len(arg) > 0 {
+		capacity = arg[0]
+	}
+	var ll = make(ChannelLockType, capacity)
 	return &ll
 }

@@ -6,139 +6,105 @@ import (
 	"sync"
 	"time"
 
+	"fmt"
+	"github.com/cloudnativelabs/kube-router/pkg/controllers"
 	"github.com/cloudnativelabs/kube-router/pkg/options"
 	"github.com/golang/glog"
 	"golang.org/x/net/context"
 )
 
-//ControllerHeartbeat is the structure to hold the heartbeats sent by controllers
-type ControllerHeartbeat struct {
-	Component     string
-	LastHeartBeat time.Time
-}
+var CONTROLLER_NAME = []string{"HealthCheck controller", "HC"}
 
 //HealthController reports the health of the controller loops as a http endpoint
 type HealthController struct {
 	HealthPort  uint16
 	HTTPEnabled bool
-	Status      HealthStats
+	Healthy     bool
+	Status      map[controllers.Controller]*HealthStats
+	regCntrls   []controllers.Controller
 	Config      *options.KubeRouterConfig
 }
 
 //HealthStats is holds the latest heartbeats
 type HealthStats struct {
-	sync.Mutex
-	Healthy                           bool
-	MetricsControllerAlive            time.Time
-	NetworkPolicyControllerAlive      time.Time
-	NetworkPolicyControllerAliveTTL   time.Duration
-	NetworkRoutingControllerAlive     time.Time
-	NetworkRoutingControllerAliveTTL  time.Duration
-	NetworkServicesControllerAlive    time.Time
-	NetworkServicesControllerAliveTTL time.Duration
+	Name       string
+	Alive      time.Time
+	AliveTTL   time.Duration
+	SyncPeriod time.Duration
+
+	ExtraInfo fmt.Stringer
 }
 
 //SendHeartBeat sends a heartbeat on the passed channel
-func SendHeartBeat(channel chan<- *ControllerHeartbeat, controller string) {
-	heartbeat := ControllerHeartbeat{
+func SendHeartBeat(channel chan<- *controllers.ControllerHeartbeat, controller controllers.Controller, internalData fmt.Stringer) {
+	heartbeat := controllers.ControllerHeartbeat{
 		Component:     controller,
 		LastHeartBeat: time.Now(),
+		Data:          internalData,
 	}
 	channel <- &heartbeat
 }
 
+func (hc *HealthController) String() (out string) {
+
+	for _, pController := range hc.regCntrls {
+		controller := hc.Status[pController]
+		out += fmt.Sprintf("\n%s last alive %s ago\n", controller.Name, time.Since(controller.Alive))
+		if controller.ExtraInfo != nil {
+			out += fmt.Sprintf("\t\t%s\n", controller.ExtraInfo.String())
+		}
+	}
+	return out + "\n"
+}
+
 //Handler writes HTTP responses to the health path
 func (hc *HealthController) Handler(w http.ResponseWriter, req *http.Request) {
-	if hc.Status.Healthy {
+	if hc.Healthy {
 		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(hc.String()))
 		w.Write([]byte("OK\n"))
 	} else {
 		w.WriteHeader(http.StatusInternalServerError)
-		/*
-			statusText := fmt.Sprintf("Service controller last alive %s\n ago"+
-				"Routing controller last alive: %s\n ago"+
-				"Policy controller last alive: %s\n ago"+
-				"Metrics controller last alive: %s\n ago",
-				time.Since(hc.Status.NetworkServicesControllerAlive),
-				time.Since(hc.Status.NetworkRoutingControllerAlive),
-				time.Since(hc.Status.NetworkPolicyControllerAlive),
-				time.Since(hc.Status.MetricsControllerAlive))
-			w.Write([]byte(statusText))
-		*/
+		w.Write([]byte(hc.String()))
 		w.Write([]byte("Unhealthy"))
 	}
 }
 
 //HandleHeartbeat handles received heartbeats on the health channel
-func (hc *HealthController) HandleHeartbeat(beat *ControllerHeartbeat) {
-	glog.V(3).Infof("Received heartbeat from %s", beat.Component)
-
-	hc.Status.Lock()
-	defer hc.Status.Unlock()
-
-	switch {
-	// The first heartbeat will set the initial gracetime the controller has to report in, A static time is added as well when checking to allow for load variation in sync time
-	case beat.Component == "NSC":
-		if hc.Status.NetworkServicesControllerAliveTTL == 0 {
-			hc.Status.NetworkServicesControllerAliveTTL = time.Since(hc.Status.NetworkServicesControllerAlive)
-		}
-		hc.Status.NetworkServicesControllerAlive = beat.LastHeartBeat
-
-	case beat.Component == "NRC":
-		if hc.Status.NetworkRoutingControllerAliveTTL == 0 {
-			hc.Status.NetworkRoutingControllerAliveTTL = time.Since(hc.Status.NetworkRoutingControllerAlive)
-		}
-		hc.Status.NetworkRoutingControllerAlive = beat.LastHeartBeat
-
-	case beat.Component == "NPC":
-		if hc.Status.NetworkPolicyControllerAliveTTL == 0 {
-			hc.Status.NetworkPolicyControllerAliveTTL = time.Since(hc.Status.NetworkPolicyControllerAlive)
-		}
-		hc.Status.NetworkPolicyControllerAlive = beat.LastHeartBeat
-
-	case beat.Component == "MC":
-		hc.Status.MetricsControllerAlive = beat.LastHeartBeat
+func (hc *HealthController) HandleHeartbeat(beat *controllers.ControllerHeartbeat) {
+	if beat == nil {
+		return
 	}
+	glog.V(3).Infof("Received heartbeat from %s", hc.Status[beat.Component].Name)
+
+	if hc.Status[beat.Component].AliveTTL == 0 {
+		hc.Status[beat.Component].AliveTTL = time.Since(hc.Status[beat.Component].Alive)
+	}
+	hc.Status[beat.Component].Alive = beat.LastHeartBeat
+	hc.Status[beat.Component].ExtraInfo = beat.Data
 }
 
 // CheckHealth evaluates the time since last heartbeat to decide if the controller is running or not
 func (hc *HealthController) CheckHealth() bool {
-	health := true
+	health := 1
 	graceTime := time.Duration(1500 * time.Millisecond)
 
-	if hc.Config.RunFirewall {
-		if time.Since(hc.Status.NetworkPolicyControllerAlive) > hc.Config.IPTablesSyncPeriod+hc.Status.NetworkPolicyControllerAliveTTL+graceTime {
-			glog.Error("Network Policy Controller heartbeat missed")
-			health = false
+	for _, controller := range hc.Status {
+		if time.Since(controller.Alive) > controller.SyncPeriod+controller.AliveTTL+graceTime {
+			glog.Error(controller.Name + " heartbeat missed")
+			health &= 0
 		}
 	}
+	hc.Healthy = health == 1
+	return hc.Healthy
+}
 
-	if hc.Config.RunRouter {
-		if time.Since(hc.Status.NetworkRoutingControllerAlive) > hc.Config.RoutesSyncPeriod+hc.Status.NetworkRoutingControllerAliveTTL+graceTime {
-			glog.Error("Network Routing Controller heartbeat missed")
-			health = false
-		}
-	}
-
-	if hc.Config.RunServiceProxy {
-		if time.Since(hc.Status.NetworkServicesControllerAlive) > hc.Config.IpvsSyncPeriod+hc.Status.NetworkServicesControllerAliveTTL+graceTime {
-			glog.Error("NetworkService Controller heartbeat missed")
-			health = false
-		}
-	}
-
-	if hc.Config.MetricsEnabled {
-		if time.Since(hc.Status.MetricsControllerAlive) > 5*time.Second {
-			glog.Error("Metrics Controller heartbeat missed")
-			health = false
-		}
-	}
-
-	return health
+func (hc *HealthController) GetData() ([]string, time.Duration) {
+	return CONTROLLER_NAME, time.Duration(5 * time.Second)
 }
 
 //RunServer starts the HealthController's server
-func (hc *HealthController) RunServer(stopCh <-chan struct{}, wg *sync.WaitGroup) error {
+func (hc *HealthController) Run(healthChan chan *controllers.ControllerHeartbeat, stopCh <-chan struct{}, wg *sync.WaitGroup) error {
 	defer wg.Done()
 	srv := &http.Server{Addr: ":" + strconv.Itoa(int(hc.HealthPort)), Handler: http.DefaultServeMux}
 	http.HandleFunc("/healthz", hc.Handler)
@@ -156,44 +122,38 @@ func (hc *HealthController) RunServer(stopCh <-chan struct{}, wg *sync.WaitGroup
 		hc.HTTPEnabled = false
 	}
 
-	select {
-	case <-stopCh:
-		glog.Infof("Shutting down health controller")
-		if hc.HTTPEnabled {
-			if err := srv.Shutdown(context.Background()); err != nil {
-				glog.Errorf("could not shutdown: %v", err)
-			}
-		}
-		return nil
-	}
-}
+	go hc.checkHealth()
 
-//RunCheck starts the HealthController's check
-func (hc *HealthController) RunCheck(healthChan <-chan *ControllerHeartbeat, stopCh <-chan struct{}, wg *sync.WaitGroup) error {
-	t := time.NewTicker(5000 * time.Millisecond)
-	defer wg.Done()
-	for {
+	t := time.NewTicker(5 * time.Second)
+	shutdown := false
+
+	for !shutdown {
 		select {
 		case <-stopCh:
 			glog.Infof("Shutting down HealthController RunCheck")
-			return nil
+			shutdown = true
 		case heartbeat := <-healthChan:
 			hc.HandleHeartbeat(heartbeat)
 		case <-t.C:
-			glog.V(4).Info("Health controller tick")
+			SendHeartBeat(healthChan, hc, nil)
 		}
-		hc.Status.Healthy = hc.CheckHealth()
 	}
+
+	glog.Infof("Shutting down health controller")
+	if hc.HTTPEnabled {
+		if err := srv.Shutdown(context.Background()); err != nil {
+			glog.Errorf("could not shutdown: %v", err)
+		}
+	}
+	return nil
 }
 
-func (hc *HealthController) SetAlive() {
-
-	now := time.Now()
-
-	hc.Status.MetricsControllerAlive = now
-	hc.Status.NetworkPolicyControllerAlive = now
-	hc.Status.NetworkRoutingControllerAlive = now
-	hc.Status.NetworkServicesControllerAlive = now
+func (hc *HealthController) SetAlive(cntr controllers.Controller) {
+	if hc.Status[cntr] == nil {
+		name, syncPeriod := cntr.GetData()
+		hc.Status[cntr] = &HealthStats{Name: name[0], Alive: time.Now(), SyncPeriod: syncPeriod}
+		hc.regCntrls = append(hc.regCntrls, cntr)
+	}
 }
 
 //NewHealthController creates a new health controller and returns a reference to it
@@ -201,9 +161,14 @@ func NewHealthController(config *options.KubeRouterConfig) (*HealthController, e
 	hc := HealthController{
 		Config:     config,
 		HealthPort: config.HealthPort,
-		Status: HealthStats{
-			Healthy: true,
-		},
+		Status:     make(map[controllers.Controller]*HealthStats),
+		regCntrls:  make([]controllers.Controller, 0),
 	}
 	return &hc, nil
+}
+
+func (hc *HealthController) checkHealth() {
+	for range time.Tick(2 * time.Second) {
+		hc.CheckHealth()
+	}
 }

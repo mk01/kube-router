@@ -3,9 +3,7 @@ package proxy
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"net"
-	"os"
 	"os/exec"
 	"strings"
 	"syscall"
@@ -14,11 +12,11 @@ import (
 	"github.com/cloudnativelabs/kube-router/pkg/utils"
 	"github.com/mqliang/libipvs"
 
-	"github.com/google/go-cmp/cmp"
 	"github.com/pkg/errors"
 
 	"github.com/cloudnativelabs/kube-router/pkg/utils/net-tools"
-	"github.com/coreos/go-iptables/iptables"
+	"github.com/golang/glog"
+	"github.com/google/go-cmp/cmp"
 	"sync/atomic"
 )
 
@@ -45,20 +43,20 @@ const (
 	ROUTE_TABLE_EXTERNAL = "external_ip"
 )
 
-var customRouteTables = map[string]routeTableType{
-	ROUTE_TABLE_DSR: {
-		desc:        "Setting up policy routing required for Direct Server Return functionality.",
-		id:          "78",
-		name:        ROUTE_TABLE_DSR,
-		forChecking: routeTableCheck{cmd: []string{"route", "list", "table", ROUTE_TABLE_DSR}, output: "dev lo"},
-		cmd:         []string{"route", "replace", "local", "default", "dev", "lo", "table", ROUTE_TABLE_DSR},
+var customRouteTables = netutils.RouteTableMapType{
+	ROUTE_TABLE_DSR: netutils.RouteTableType{
+		Desc:        "Setting up policy routing required for Direct Server Return functionality.",
+		Id:          "78",
+		Name:        ROUTE_TABLE_DSR,
+		ForChecking: netutils.RouteTableCheck{Cmd: []string{"route", "list", "table", ROUTE_TABLE_DSR}, Output: "dev lo"},
+		Cmd:         []string{"route", "replace", "local", "default", "dev", "lo", "table", ROUTE_TABLE_DSR},
 	},
-	ROUTE_TABLE_EXTERNAL: {
-		desc:        "Setting up custom route table required to add routes for external IP's.",
-		id:          "79",
-		name:        ROUTE_TABLE_EXTERNAL,
-		forChecking: routeTableCheck{cmd: []string{"rule", "list"}, output: "lookup " + ROUTE_TABLE_EXTERNAL},
-		cmd:         []string{"rule", "add", "prio", "32765", "from", "all", "lookup", ROUTE_TABLE_EXTERNAL},
+	ROUTE_TABLE_EXTERNAL: netutils.RouteTableType{
+		Desc:        "Setting up custom route table required to add routes for external IP's.",
+		Id:          "79",
+		Name:        ROUTE_TABLE_EXTERNAL,
+		ForChecking: netutils.RouteTableCheck{Cmd: []string{"rule", "list"}, Output: "lookup " + ROUTE_TABLE_EXTERNAL},
+		Cmd:         []string{"rule", "add", "prio", "32765", "from", "all", "lookup", ROUTE_TABLE_EXTERNAL},
 	},
 }
 
@@ -77,38 +75,38 @@ var linkedServiceTypeToString = map[linkedServiceType]string{
 
 type KubeService struct {
 	*libipvs.Service
-	lt   linkedServiceType
-	ln   LinuxNetworking
-	used *map[*endpointInfo]bool
+	lt       linkedServiceType
+	ln       LinuxNetworking
+	ipvsHash infoMapsKeyType
+
+	*UsageLockType
 }
 
-type routeTableCheck struct {
-	cmd    []string
-	output string
-}
+type keyMetrics struct {
+	services     int
+	destinations int
 
-type routeTableType struct {
-	desc        string
-	id          string
-	name        string
-	cmd         []string
-	forChecking routeTableCheck
+	lastSync time.Duration
+	fmt.Stringer
 }
 
 type synchChangeType byte
-
-type perProtocolRuleType map[netutils.Proto]netutils.IpTablesRuleListType
 
 type epActionType bool
 
 type linkedServiceType int
 
-var allEndpointTypes = []linkedServiceType{LINKED_SERVICE_EXTERNALIP, LINKED_SERVICE_NODEPORT, LINKED_SERVICE_NOTLINKED}
+type linkedServiceListType []linkedServiceType
+
+var allEndpointTypes = linkedServiceListType{LINKED_SERVICE_EXTERNALIP, LINKED_SERVICE_NODEPORT, LINKED_SERVICE_NOTLINKED}
 
 var DeepComparerIpvsDestination = cmp.Comparer(DeepCompareDestination)
 var ComparerIpvsDestination = cmp.Comparer(CompareEndpointDestination)
-var ComparerIpvsService = cmp.Comparer(CompareService)
 var ComparerKubeService = cmp.Comparer(CompareKubeService)
+
+func init() {
+	go watcher()
+}
 
 func (so *serviceObject) String() string {
 	out := fmt.Sprintf("\nmeta: %v\n", *so.meta)
@@ -128,9 +126,9 @@ func (ksa *kubeServiceArrayType) String() (out string) {
 }
 
 func (ls *linkedServiceListMapType) String() (out string) {
-	for _, lt := range allEndpointTypes {
+	allEndpointTypes.ForEach(func(lt linkedServiceType) {
 		out += fmt.Sprintf("\n%s: %s", lt, (*ls)[lt].String())
-	}
+	})
 	return
 }
 
@@ -145,8 +143,8 @@ func (ks *KubeService) String() string {
 			flags += str
 		}
 	}
-	return fmt.Sprintf("%s:%s (Flags: %s), used %d", ks.Protocol.String(),
-		netutils.NewIP(ks.Address).ToStringWithPort(fmt.Sprint(ks.Port)), flags, len(*ks.used))
+	return fmt.Sprintf("%s:%s (Flags: %s)", ks.Protocol.String(),
+		netutils.NewIP(ks.Address).ToStringWithPort(fmt.Sprint(ks.Port)), flags)
 }
 
 func (eps *endpointInfoMapType) String() string {
@@ -170,8 +168,19 @@ func (sc synchChangeType) String() string {
 }
 
 func (ep *endpointInfo) String() string {
-	return fmt.Sprintf("addr: %s, port: %s, locks: %d, change: %s", ep.Address,
-		fmt.Sprint(ep.Port), ep.used, ep.change.String())
+	return fmt.Sprintf("addr: %s, locks: %d, change: %s",
+		netutils.NewIP(ep.Address).ToStringWithPort(fmt.Sprint(ep.Port)), atomic.LoadUint32(&ep.used), ep.change.String())
+}
+
+func (km keyMetrics) String() string {
+	return "= Services: " + fmt.Sprint(km.services) + ", Destinations: " + fmt.Sprint(km.destinations) +
+		", LastSync took: " + km.lastSync.String()
+}
+
+func (sm *serviceInfoMapType) ForEach(f func(*serviceObject)) {
+	for _, so := range *sm {
+		f(so)
+	}
 }
 
 func (sc synchChangeType) CheckFor(t synchChangeType) bool {
@@ -197,52 +206,75 @@ func (ksa *kubeServiceArrayType) add(ks *KubeService) {
 	*ksa = append(*ksa, ks)
 }
 
+func (ksa *kubeServiceArrayType) forEach(f func(*KubeService)) {
+	for _, ks := range *ksa {
+		f(ks)
+	}
+}
+
 func (ksa *kubeServiceArrayType) remove(ks *KubeService) {
-	i := ksa.isPresent(ks)
-	copy((*ksa)[i:], (*ksa)[i+1:])
-	(*ksa)[len(*ksa)-1] = nil
-	*ksa = (*ksa)[:len(*ksa)-1]
+	if i := ksa.isPresent(ks); i != -1 {
+		copy((*ksa)[i:], (*ksa)[i+1:])
+		(*ksa)[len(*ksa)-1] = nil
+		*ksa = (*ksa)[:len(*ksa)-1]
+	}
+}
+
+func (lsl *linkedServiceListType) ForEach(f func(linkedServiceType)) {
+	for _, lt := range *lsl {
+		f(lt)
+	}
 }
 
 func (ls *linkedServiceListMapType) clear(lt linkedServiceType) {
-	(*ls)[lt] = new(kubeServiceArrayType)
+	(*ls)[lt] = &kubeServiceArrayType{}
 }
 
 func (ls *linkedServiceListMapType) init() {
-	for _, lt := range allEndpointTypes {
-		(*ls).clear(lt)
-	}
+	allEndpointTypes.ForEach((*ls).clear)
 }
 
 func (ks *KubeService) isFwMarkService() bool {
 	return ks.FWMark != 0
 }
 
-func (ks *KubeService) clone(ip *net.IPNet, isFWMark bool, lt linkedServiceType, info *serviceInfo) *KubeService {
-	newKs := KubeService{ln: ks.ln, lt: lt, used: ks.used}
-	ipvs := *ks.Service
-	newKs.Service = &ipvs
+func (ks *KubeService) clone(ip *net.IPNet, isFWMark bool, lt linkedServiceType, so *serviceObject) *KubeService {
+	var used uint32 = 0
+	clonedKs := &KubeService{Service: &libipvs.Service{}, ln: ks.ln, lt: lt, UsageLockType: &UsageLockType{used:used}}
+	ipvsSvc := *ks.Service
+	clonedKs.Service = &ipvsSvc
 
 	if ip != nil {
-		newKs.Address = ip.IP
+		clonedKs.Address = ip.IP
 	}
+
 	if lt == LINKED_SERVICE_NODEPORT {
-		newKs.Port = info.Nodeport
+		clonedKs.Port = so.info.Nodeport
 	}
+
+	clonedKs.ipvsHash = generateFwmark(clonedKs.Service)
 	if isFWMark {
-		newKs.FWMark = uint32(generateFwmark(newKs.Service))
+		clonedKs.FWMark = uint32(clonedKs.ipvsHash)
 	}
-	return &newKs
+
+	clonedKs.UsageLockType.funcOnZero = func() {
+		so.linkedServices[lt].remove(clonedKs)
+		clonedKs.destroy()
+	}
+
+	return clonedKs
 }
 
-func (ks *KubeService) deploy(update bool) error {
-	_, err := ks.ln.ipvsAddService(ks, update)
+func (ks *KubeService) deploy(new bool) error {
+	_, err := ks.ln.ipvsAddService(ks, new || atomic.LoadUint32(&ks.used) == 0)
 	return err
 }
 
 func (ks *KubeService) destroy() (err error) {
 	if err = ks.ln.ipvsDelService(ks); err == nil {
 		ks.updateLinkAddr(NL_ADDR_REMOVE)
+	} else {
+		glog.Errorf("failed to delete %v", ks)
 	}
 	return err
 }
@@ -261,53 +293,51 @@ func (ks *KubeService) attachDestination(ep *endpointInfo) (upd bool, err error)
 	if ks.Protocol == syscall.IPPROTO_UDP {
 		ep.connTrack = true
 	}
-	if err == nil {
-		ks.lock(ep)
+	if err != nil {
+		glog.Errorf(" Error attaching destination: %s - %s", ep.String(), err.Error())
 	}
 	return
-}
-
-func (ks *KubeService) lock(ep *endpointInfo) {
-	(*ks.used)[ep] = true
-}
-
-func (ks *KubeService) release(ep *endpointInfo) {
-	delete(*ks.used, ep)
-	if len(*ks.used) == 0 {
-		ep.so.linkedServices[ks.lt].remove(ks)
-		ks.destroy()
-	}
 }
 
 func (ks *KubeService) detachDestination(ep *endpointInfo) (err error) {
 	if _, dst := ks.refreshEp(ep); dst != nil && dst.Weight != 0 {
-		ks.softDeregister(ep, dst)
-		ep.Weight = 0
-		return
-	}
-	if err = ks.ln.ipvsDelDestination(ks.Service, ep.Destination); err == nil {
-		ks.release(ep)
-		ep.release()
+		ks.softDeregister(ep)
+	} else {
+		glog.Errorf(" Error delete destination:: %s - %s", ep.String(), err.Error())
 	}
 	return
 }
 
-func (ks *KubeService) softDeregister(ep *endpointInfo, dst *libipvs.Destination) {
-	ks.putStandbyEp(ep, dst)
-	epPurgeBacklogChannel <- &epPurgeBacklogDataType{ks: ks, ep: ep}
-	if atomic.CompareAndSwapInt32(&running, 0, 1) {
-		go watcher()
+func (ks *KubeService) purgeDestination(ep *endpointInfo) (err error) {
+	if err = ks.ln.ipvsDelDestination(ks.Service, ks.getDestination(ep)); err != nil &&
+		!strings.Contains(err.Error(), "NlMsgerr no such") {
+		glog.Errorf("Can't remove destination due to: %s", err.Error())
+		return
 	}
+	var so = ep.so
+	count := ep.Unlock(ep.String())
+	ks.Unlock(ks.String())
+	if count == 0 {
+		so.epLock.Unlock()
+	}
+	return
 }
 
-func (ks *KubeService) putStandbyEp(ep *endpointInfo, dst *libipvs.Destination) (err error) {
-	dst.Weight = 0
-	return ks.ln.ipvsUpdateDestination(ks.Service, dst)
+func (ks *KubeService) softDeregister(ep *endpointInfo) {
+	ks.putStandbyEp(ep)
+	epPurgeBacklogChannel <- &epPurgeBacklogDataType{ks: ks, ep: ep, ts: time.Now()}
+}
+
+func (ks *KubeService) putStandbyEp(ep *endpointInfo) (err error) {
+	ep.so.epLock.Lock()
+	defer ep.so.epLock.Unlock()
+	ep.Weight = 0
+	return ks.ln.ipvsUpdateDestination(ks.Service, ks.getDestination(ep))
 }
 
 func (ks *KubeService) refreshEp(ep *endpointInfo) (bool, *libipvs.Destination) {
-	dsts := ks.ln.ipvsGetDestinations(ks.Service)
-	if ok, i := utils.FindElementInArray(ep.Destination, dsts, ComparerIpvsDestination); ok {
+	dsts := ks.ln.ipvsGetDestinations(ks.Service, true)
+	if ok, i := utils.FindElementInArray(ks.getDestination(ep), dsts, ComparerIpvsDestination); ok {
 		return true, dsts[i]
 	}
 	return false, nil
@@ -330,59 +360,60 @@ func (ks *KubeService) updateLinkAddr(action epActionType, addRoute ...bool) (er
 type epPurgeBacklogDataType struct {
 	ks *KubeService
 	ep *endpointInfo
+	ts time.Time
 }
 
 var epPurgeBacklogChannel = make(chan *epPurgeBacklogDataType, 50)
 
-var running int32 = 0
+var graceDownPeriod = 15 * time.Second
 
 func watcher() {
-	defer atomic.StoreInt32(&running, 0)
-
 	var wos = make(map[*epPurgeBacklogDataType]bool)
-	var length = -1
+	var wo *epPurgeBacklogDataType
 
-	for length != 0 {
-		time.Sleep(10 * time.Second)
-
-		for length != 0 {
+	for {
+		wo = &epPurgeBacklogDataType{}
+		for wo != nil {
 			select {
-			case wo := <-epPurgeBacklogChannel:
+			case wo = <-epPurgeBacklogChannel:
 				wos[wo] = true
 			default:
-				length = 0
+				time.Sleep(time.Second)
+				wo = nil
 			}
 		}
-
 		for wo := range wos {
+			if time.Since(wo.ts) < graceDownPeriod {
+				continue
+			}
 			if ok, dst := wo.ks.refreshEp(wo.ep); ok && dst.ActiveConns == 0 && dst.InactConns == 0 {
-				wo.ks.detachDestination(wo.ep)
-				delete(wos, wo)
+				if nil == wo.ks.purgeDestination(wo.ep) {
+					delete(wos, wo)
+				}
 			} else if !ok {
 				delete(wos, wo)
 			}
 		}
-		length = len(wos)
 	}
 }
 
 // For DSR it is required that we dont assign the VIP to any interface to avoid martian packets
 // http://www.austintek.com/LVS/LVS-HOWTO/HOWTO/LVS-HOWTO.routing_to_VIP-less_director.html
 // routeVIPTrafficToDirector: setups policy routing so that FWMARKed packets are deliverd locally
-func routeVIPTrafficToDirector(h *iptables.IPTables, p netutils.Proto) (err error) {
+func routeVIPTrafficToDirector(p netutils.Proto) (err error) {
 	var out []byte
 
 	inet := netutils.NewIP(p).ProtocolCmdParam().Inet
 
 	fwMarkStr := fmt.Sprintf("0x%x/0x%x", fwMarkTag, fwMarkTag)
 
-	if out, err = exec.Command("ip", inet, "rule", "list").Output(); err != nil {
+	if out, err = exec.Command(utils.GetPath("ip"), inet, "rule", "list").Output(); err != nil {
 		return errors.New("Failed to verify if `Ip rule` exists due to: " + err.Error())
 	}
 
 	output := string(out)
 	if !strings.Contains(output, "fwmark "+fwMarkStr) {
-		if err = exec.Command("ip", inet, "rule", "add", "prio", "32764", "fwmark", fwMarkStr, "table", ROUTE_TABLE_DSR).Run(); err != nil {
+		if err = exec.Command(utils.GetPath("ip"), inet, "rule", "add", "prio", "32764", "fwmark", fwMarkStr, "table", ROUTE_TABLE_DSR).Run(); err != nil {
 			return errors.New("Failed to add policy rule to lookup traffic to VIP through the custom " +
 				" routing table due to " + err.Error())
 		}
@@ -392,9 +423,8 @@ func routeVIPTrafficToDirector(h *iptables.IPTables, p netutils.Proto) (err erro
 }
 
 func fwmarkRuleFrom(ks *KubeService) (netutils.Proto, *netutils.IpTablesRuleType) {
-	return netutils.NewIP(ks.Address).Protocol(),
-		&netutils.IpTablesRuleType{"-d", ks.Address.String(), "-p", ks.Protocol.String(), "-m", ks.Protocol.String(),
-			"--dport", fmt.Sprint(ks.Port), "-j", "MARK", "--set-mark", fmt.Sprintf("0x%x", ks.FWMark)}
+	return netutils.NewIP(ks.Address).Protocol(), &netutils.IpTablesRuleType{Args: []string{"-d", ks.Address.String(), "-p", ks.Protocol.String(), "-m", ks.Protocol.String(),
+		"--dport", fmt.Sprint(ks.Port), "-j", "MARK", "--set-mark", fmt.Sprintf("0x%x", ks.FWMark)}}
 }
 
 func runInNetNS(pid int, cmd string, args ...string) ([]byte, error) {
@@ -412,29 +442,29 @@ func runInNetNS(pid int, cmd string, args ...string) ([]byte, error) {
 }
 
 func (nsc *NetworkServicesController) getFwmarkSourceData() (fwmarkData kubeServiceArrayType) {
-	for _, so := range nsc.serviceMap {
+	nsc.serviceMap.ForEach(func(so *serviceObject) {
 		if !so.isFwMarkService() {
-			continue
+			return
 		}
-		for _, ks := range *so.linkedServices[LINKED_SERVICE_EXTERNALIP] {
+		so.linkedServices[LINKED_SERVICE_EXTERNALIP].forEach(func(ks *KubeService) {
 			fwmarkData = append(fwmarkData, ks)
-		}
-	}
+		})
+	})
 
 	return fwmarkData
 }
 
 /* functions refactored using above wrapper. original  functions got "_" as prefix eg _deleteMasqueradeIptablesRule() */
 func (nsc *NetworkServicesController) deleteMasqueradeIptablesRule() error {
-	return nsc.ipm.BothTCPProtocolsWrapperNoArg(netutils.FunctionNoArgsType(nsc._deleteMasqueradeIptablesRule))
+	return netutils.UsedTcpProtocols.ForEach(nsc._deleteMasqueradeIptablesRule)
 }
 
 func (nsc *NetworkServicesController) deleteHairpinIptablesRules() error {
-	return nsc.ipm.BothTCPProtocolsWrapperNoArg(netutils.FunctionNoArgsType(nsc._deleteHairpinIptablesRules))
+	return netutils.UsedTcpProtocols.ForEach(nsc._deleteHairpinIptablesRules)
 }
 
 func (nsc *NetworkServicesController) deleteFwmarkIptablesRules() error {
-	return nsc.ipm.BothTCPProtocolsWrapperNoArg(netutils.FunctionNoArgsType(nsc._deleteFwmarkIptablesRules))
+	return netutils.UsedTcpProtocols.ForEach(nsc._deleteFwmarkIptablesRules)
 }
 
 func CompareEndpointDestination(a, b *libipvs.Destination) bool {
@@ -446,65 +476,33 @@ func DeepCompareDestination(a, b *libipvs.Destination) bool {
 }
 
 func CompareService(a, b *libipvs.Service) bool {
-	if a.FWMark != 0 || b.FWMark != 0 {
+	if (a.FWMark | b.FWMark) != 0 {
 		return a.FWMark == b.FWMark
 	}
 	return a.Address.Equal(b.Address) && a.Port == b.Port && a.Protocol == b.Protocol
 }
 
 func CompareKubeService(a, b *KubeService) bool {
+	//return a.ipvsHash == b.ipvsHash
 	return CompareService(a.Service, b.Service)
 }
 
-func setupRouteTable() error {
-	b, err := ioutil.ReadFile("/etc/iproute2/rt_tables")
-	if err != nil {
-		return errors.New("Failed to list kernel route tables: " + err.Error())
-	}
-
-	rts := string(b)
-	toAdd := make([]*routeTableType, 0)
-	for _, rt := range customRouteTables {
-		if !strings.Contains(rts, rt.name) {
-			toAdd = append(toAdd, &rt)
-		}
-	}
-	if len(toAdd) == 0 {
-		return nil
-	}
-
-	f, err := os.OpenFile("/etc/iproute2/rt_tables", os.O_APPEND|os.O_WRONLY, 0600)
-	if err != nil {
-		return errors.New("Failed to open kernel route table file for writing " + err.Error())
-	}
-	defer f.Close()
-
-	for _, rt := range toAdd {
-		if _, err = f.WriteString(rt.id + " " + rt.name + "\n"); err != nil {
-			return errors.New("Failed add route table " + rt.name + ": " + err.Error())
-		}
-	}
-	return nil
+type UsageLockType struct {
+	used        uint32
+	funcOnZero  func()
 }
 
-func setupCustomRouteTable(rt routeTableType) error {
-	for _, inet := range [][]string{{"-4"}, {"-6"}} {
-		args := append(inet, rt.forChecking.cmd...)
-		out, err := exec.Command("ip", args...).Output()
-		if err != nil {
-			if err = setupRouteTable(); err == nil {
-				out, err = exec.Command("ip", args...).Output()
-			}
-		}
-		if err != nil {
-			return errors.New("Failed to create " + rt.name + " route table: " + err.Error())
-		}
-		if !strings.Contains(string(out), rt.forChecking.output) {
-			args = append(inet, rt.cmd...)
-			if err = exec.Command("ip", args...).Run(); err != nil {
-				return errors.New("Failed to run: " + strings.Join(args, " ") + ": " + err.Error())
-			}
-		}
+func (lk *UsageLockType) Lock(id string) uint32 {
+	count := atomic.AddUint32(&lk.used, uint32(1))
+	fmt.Println("Lock: ", id, " ==", count)
+	return count
+}
+
+func (lk *UsageLockType) Unlock(id string) uint32 {
+	count := atomic.AddUint32(&lk.used, ^uint32(0))
+	if count == 0 && lk.funcOnZero != nil {
+		lk.funcOnZero()
 	}
-	return nil
+	fmt.Println("unlock: ", id, " ==", count)
+	return count
 }

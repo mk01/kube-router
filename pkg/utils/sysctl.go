@@ -14,6 +14,11 @@ type SysctlError struct {
 	fatal  bool
 }
 
+type SysCtlConfigRuleType struct {
+	Path  string
+	Value int
+}
+
 // Error return the error as string
 func (e *SysctlError) Error() string {
 	return fmt.Sprintf("Sysctl %s=%d : %s", e.option, e.value, e.err)
@@ -25,17 +30,17 @@ func (e *SysctlError) IsFatal() bool {
 }
 
 // SetSysctl sets a sysctl value
-func SetSysctl(path string, value int) *SysctlError {
-	sysctlPath := fmt.Sprintf("/proc/sys/%s", path)
+func SetSysctl(c SysCtlConfigRuleType) *SysctlError {
+	sysctlPath := fmt.Sprintf("/proc/sys/%s", c.Path)
 	if _, err := os.Stat(sysctlPath); err != nil {
 		if os.IsNotExist(err) {
-			return &SysctlError{"option not found, Does your kernel version support this feature?", path, value, false}
+			return &SysctlError{"option not found, Does your kernel version support this feature?", c.Path, c.Value, false}
 		}
-		return &SysctlError{"stat error: " + err.Error(), path, value, true}
+		return &SysctlError{"stat error: " + err.Error(), c.Path, c.Value, true}
 	}
-	err := ioutil.WriteFile(sysctlPath, []byte(strconv.Itoa(value)), 0640)
+	err := ioutil.WriteFile(sysctlPath, []byte(strconv.Itoa(c.Value)), 0640)
 	if err != nil {
-		return &SysctlError{"could not set due to: " + err.Error(), path, value, true}
+		return &SysctlError{"could not set due to: " + err.Error(), c.Path, c.Value, true}
 	}
 	return nil
 }

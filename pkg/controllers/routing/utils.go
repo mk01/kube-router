@@ -8,10 +8,10 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/cloudnativelabs/kube-router/pkg/utils"
 	"github.com/cloudnativelabs/kube-router/pkg/utils/net-tools"
 	"github.com/osrg/gobgp/config"
 	"github.com/osrg/gobgp/packet/bgp"
+	"github.com/cloudnativelabs/kube-router/pkg/utils"
 )
 
 // Used for processing Annotations that may contain multiple items
@@ -97,15 +97,21 @@ func getNodeSubnet(linkFilter func(p net.Interface) bool, nodeIP net.IP) (*netut
 	return netutils.NewIP(nodeIP), "", errors.New("Failed to find interface with specified node ip")
 }
 
-func SearchForBiggerPrefix(ip net.IP) (net.IPNet, string, error) {
+func getLinkAssignedPrefix(ip net.IP) (net.IPNet, string, error) {
 	ipnet, link, err := getNodeSubnet(utils.FilterInterfaces, ip)
 	if err != nil {
 		return *ipnet.ToIPNet(), link, err
 	}
+
+	if netutils.NewIP(ip).IsIPv4() {
+		return *ipnet.ToIPNet(), link, nil
+	}
+
 	ifnet, err := net.InterfaceByName(link)
 	if err != nil {
 		return *ipnet.ToIPNet(), link, err
 	}
+
 	addrs, err := ifnet.Addrs()
 	if err != nil {
 		return *ipnet.ToIPNet(), link, err
@@ -113,12 +119,13 @@ func SearchForBiggerPrefix(ip net.IP) (net.IPNet, string, error) {
 
 	for _, addr := range addrs {
 		toCheck := netutils.NewIP(addr)
-		if ipnet.ToIP().Equal(toCheck.ToIP()) {
+		if toCheck.IsIPv4() || !toCheck.ToIP().IsLinkLocalUnicast() {
 			continue
 		}
 
-		if toCheck.Contains(ipnet) && ipnet.ToPrefix() > toCheck.ToPrefix() {
-			ipnet = toCheck
+		split := strings.Split(addr.String(), "/")
+		if len(split) > 1 {
+			ipnet = netutils.NewIP(ip.String() + "/" + split[1])
 		}
 	}
 	return *ipnet.ToIPNet(), link, nil

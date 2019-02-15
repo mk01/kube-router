@@ -18,6 +18,7 @@ import (
 	"github.com/cloudnativelabs/kube-router/pkg/options"
 	"github.com/golang/glog"
 
+	"github.com/cloudnativelabs/kube-router/pkg/utils/net-tools"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -33,6 +34,7 @@ var buildDate string
 type KubeRouter struct {
 	Client kubernetes.Interface
 	Config *options.KubeRouterConfig
+	hc     *healthcheck.HealthController
 }
 
 // NewKubeRouterDefault returns a KubeRouter object
@@ -64,17 +66,21 @@ func NewKubeRouterDefault(config *options.KubeRouterConfig) (*KubeRouter, error)
 
 // CleanupConfigAndExit performs Cleanup on all three controllers
 func CleanupConfigAndExit() {
-	npc := netpol.NetworkPolicyController{}
+	ipm := netutils.NewIpTablesManager([]string{})
+
+	npc := netpol.NetworkPolicyController{Ipm: ipm}
 	npc.Cleanup()
 
-	nsc := proxy.NetworkServicesController{}
+	nsc := proxy.NetworkServicesController{Ipm: ipm}
 	nsc.Cleanup()
 
-	nrc := routing.NetworkRoutingController{}
+	nrc := routing.NetworkRoutingController{Ipm: ipm}
 	nrc.Cleanup()
 }
 
-func (kr *KubeRouter) spawnController(healthCh chan *healthcheck.ControllerHeartbeat, stopCh chan struct{}, wg *sync.WaitGroup, cnt controllers.Controller) {
+func (kr *KubeRouter) spawnController(healthCh chan *controllers.ControllerHeartbeat, stopCh <-chan struct{}, wg *sync.WaitGroup, cnt controllers.Controller) {
+	kr.hc.SetAlive(cnt)
+
 	if err := cnt.Run(healthCh, stopCh, wg); err != nil {
 		glog.Errorf("Can't start controller: %s", err.Error())
 	}
@@ -84,7 +90,7 @@ func (kr *KubeRouter) spawnController(healthCh chan *healthcheck.ControllerHeart
 func (kr *KubeRouter) Run() error {
 	var err error
 	var wg sync.WaitGroup
-	healthChan := make(chan *healthcheck.ControllerHeartbeat, 10)
+	healthChan := make(chan *controllers.ControllerHeartbeat, 10)
 	defer close(healthChan)
 	stopCh := make(chan struct{})
 
@@ -93,12 +99,12 @@ func (kr *KubeRouter) Run() error {
 		os.Exit(0)
 	}
 
-	hc, err := healthcheck.NewHealthController(kr.Config)
+	kr.hc, err = healthcheck.NewHealthController(kr.Config)
 	if err != nil {
 		return errors.New("Failed to create health controller: " + err.Error())
 	}
 	wg.Add(1)
-	go hc.RunServer(stopCh, &wg)
+	go kr.spawnController(healthChan, stopCh, &wg, kr.hc)
 
 	informerFactory := informers.NewSharedInformerFactory(kr.Client, 0)
 	svcInformer := informerFactory.Core().V1().Services().Informer()
@@ -113,10 +119,6 @@ func (kr *KubeRouter) Run() error {
 	if err != nil {
 		return errors.New("Failed to synchronize cache: " + err.Error())
 	}
-
-	hc.SetAlive()
-	wg.Add(1)
-	go hc.RunCheck(healthChan, stopCh, &wg)
 
 	if (kr.Config.MetricsPort > 0) && (kr.Config.MetricsPort <= 65535) {
 		kr.Config.MetricsEnabled = true

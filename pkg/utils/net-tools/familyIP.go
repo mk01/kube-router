@@ -2,10 +2,10 @@ package netutils
 
 import (
 	"fmt"
+	"github.com/cloudnativelabs/kube-router/pkg/utils"
 	"github.com/coreos/go-iptables/iptables"
 	"github.com/osrg/gobgp/config"
 	"github.com/osrg/gobgp/packet/bgp"
-	"github.com/vishvananda/netlink"
 	"net"
 	"strings"
 	"syscall"
@@ -18,7 +18,7 @@ type IqIp struct {
 	addr *net.IPNet
 
 	protocol Proto
-	error    *error
+	error    error
 }
 
 func NewList(ips []string) []*net.IPNet {
@@ -51,7 +51,7 @@ func NewIP(in interface{}) *IqIp {
 	switch inTyped := in.(type) {
 	case string:
 		if strings.Contains(inTyped, "/") {
-			ip.fromCIDR(inTyped)
+			ip.error = ip.fromCIDR(inTyped)
 		} else {
 			ip.fromIP(net.ParseIP(inTyped))
 		}
@@ -71,6 +71,7 @@ func (xip *IqIp) fromIP(ip net.IP) *IqIp {
 func (xip *IqIp) fromCIDR(addr string) error {
 	ip, ipnet, err := net.ParseCIDR(addr)
 	if err != nil {
+		xip.error = err
 		return fmt.Errorf("Can't get address %s", err)
 	}
 
@@ -175,7 +176,7 @@ func (xip *IqIp) Protocol() Proto {
 }
 
 func (xip *IqIp) ToError() error {
-	return *xip.error
+	return xip.error
 }
 func (xip *IqIp) Family() uint16 {
 	if xip.protocol == V4 {
@@ -184,22 +185,16 @@ func (xip *IqIp) Family() uint16 {
 	return syscall.AF_INET6
 }
 
-func (xip *IqIp) NetlinkFamily() uint16 {
-	if xip.protocol == V4 {
-		return netlink.FAMILY_V4
-	}
-	return netlink.FAMILY_V6
-}
-
 type IpCmdParams struct {
-	Inet, Mode, IptCmd, IcmpStr string
+	Inet, Mode, IptCmd, IcmpStr, TunnelProto string
+	ReduceMTU int
 }
 
 func (xip *IqIp) ProtocolCmdParam() *IpCmdParams {
 	if xip.protocol == V4 {
-		return &IpCmdParams{Inet: "-4", Mode: "ipip", IptCmd: "iptables", IcmpStr: "icmp"}
+		return &IpCmdParams{ReduceMTU: 20, Inet: "-4", Mode: "ipip", TunnelProto: "4", IptCmd: utils.GetPath("iptables"), IcmpStr: "icmp"}
 	}
-	return &IpCmdParams{Inet: "-6", Mode: "ip6ip6", IptCmd: "ip6tables", IcmpStr: "icmpv6"}
+	return &IpCmdParams{ReduceMTU: 40, Inet: "-6", Mode: "ip6ip6", TunnelProto: "41", IptCmd: utils.GetPath("ip6tables"), IcmpStr: "icmpv6"}
 }
 
 func (xip *IqIp) Contains(in interface{}) bool {
@@ -207,6 +202,7 @@ func (xip *IqIp) Contains(in interface{}) bool {
 	case *IqIp:
 		return xip.addr.Contains(check.ToIP())
 	case net.IP:
+		return xip.Contains(NewIP(check))
 	case *net.IP:
 		return xip.Contains(NewIP(check))
 	}

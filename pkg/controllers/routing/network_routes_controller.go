@@ -24,24 +24,21 @@ import (
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netlink/nl"
 
+	"github.com/cloudnativelabs/kube-router/pkg/controllers"
 	"github.com/cloudnativelabs/kube-router/pkg/utils"
 	"github.com/cloudnativelabs/kube-router/pkg/utils/net-tools"
-	"github.com/coreos/go-iptables/iptables"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 )
 
 const (
-	CONTROLLER_NAME = "Routes controller"
-
 	IFACE_NOT_FOUND = "Link not found"
 
 	CHAIN_BGP_EGRESS_RULE = "KUBE-ROUTER-BGP-EGRESS"
 
 	customRouteTableID   = "77"
-	customRouteTableName = "kube-router"
+	customRouteTableName = "kube-router-overlay"
 	podSubnetsIPSetName  = "kube-router-pod-subnets"
 	nodeAddrsIPSetName   = "kube-router-node-ips"
 
@@ -66,6 +63,8 @@ const (
 	svcSkipLbIpsAnnotation = "kube-router.io/service.skiplbips"
 )
 
+var CONTROLLER_NAME = []string{"Routes controller", "NRC"}
+
 // NetworkRoutingController is struct to hold necessary information required by controller
 type NetworkRoutingController struct {
 	nodeIP                  net.IP
@@ -73,7 +72,6 @@ type NetworkRoutingController struct {
 	nodeSubnet              net.IPNet
 	nodeInterface           string
 	routerId                string
-	isIpv6                  bool
 	activeNodes             map[string]bool
 	mu                      sync.Mutex
 	clientset               kubernetes.Interface
@@ -122,15 +120,16 @@ type NetworkRoutingController struct {
 	ServiceEventHandler   cache.ResourceEventHandler
 	EndpointsEventHandler cache.ResourceEventHandler
 
-	ipm *netutils.IpTablesManager
+	Ipm *netutils.IpTablesManager
+	rtm *netutils.RouteTableManager
 }
 
-func (nrc *NetworkRoutingController) GetName() string {
-	return CONTROLLER_NAME
+func (nrc *NetworkRoutingController) GetData() ([]string, time.Duration) {
+	return CONTROLLER_NAME, nrc.syncPeriod
 }
 
 // Run runs forever until we are notified on stop channel
-func (nrc *NetworkRoutingController) Run(healthChan chan<- *healthcheck.ControllerHeartbeat, stopCh <-chan struct{}, wg *sync.WaitGroup) (err error) {
+func (nrc *NetworkRoutingController) Run(healthChan chan *controllers.ControllerHeartbeat, stopCh <-chan struct{}, wg *sync.WaitGroup) (err error) {
 	if nrc.enableCNI {
 		nrc.updateCNIConfig()
 	}
@@ -154,24 +153,14 @@ func (nrc *NetworkRoutingController) Run(healthChan chan<- *healthcheck.Controll
 	}
 
 	// Handle ipip tunnel overlay
-	if nrc.enableOverlays {
-		glog.V(1).Info("IPIP Tunnel Overlay enabled in configuration.")
-		glog.V(1).Info("Setting up overlay networking.")
-		err = nrc.enablePolicyBasedRouting()
-		if err != nil {
-			glog.Errorf("Failed to enable required policy based routing: %s", err.Error())
-		}
-	} else {
-		glog.V(1).Info("IPIP Tunnel Overlay disabled in configuration.")
-		glog.V(1).Info("Cleaning up old overlay networking if needed.")
-		err = nrc.disablePolicyBasedRouting()
-		if err != nil {
-			glog.Errorf("Failed to disable policy based routing: %s", err.Error())
-		}
+	glog.V(1).Info("Setting up overlay networking.")
+	err = nrc.setupPolicyBasedRouting(nrc.enableOverlays)
+	if err != nil {
+		glog.Errorf("Failed to %v policy based routing: %s", nrc.enableOverlays, err.Error())
 	}
 
 	glog.V(1).Infoln("Applying pod egress configuration.")
-	nrc.enableIptables(netutils.IPTABLES_CLEAR_EXISTING_CHAIN)
+	nrc.enableIptables(netutils.IPTABLES_FULL_CHAIN_SYNC_NO_ORDER)
 
 	// create 'kube-bridge' interface to which pods will be connected
 	_, err = netlink.LinkByName("kube-bridge")
@@ -199,11 +188,8 @@ func (nrc *NetworkRoutingController) Run(healthChan chan<- *healthcheck.Controll
 	if err = ioutil.WriteFile("/proc/sys/net/bridge/bridge-nf-call-iptables", []byte(strconv.Itoa(1)), 0640); err != nil {
 		glog.Errorf("Failed to enable iptables for bridge. Network policies and service proxy may not work: %s", err.Error())
 	}
-	if nrc.isIpv6 {
-		if err = ioutil.WriteFile("/proc/sys/net/bridge/bridge-nf-call-ip6tables", []byte(strconv.Itoa(1)), 0640); err != nil {
-			glog.Errorf("Failed to enable ip6tables for bridge. Network policies and service proxy may not work: %s", err.Error())
-		}
-
+	if err = ioutil.WriteFile("/proc/sys/net/bridge/bridge-nf-call-ip6tables", []byte(strconv.Itoa(1)), 0640); err != nil {
+		glog.Errorf("Failed to enable ip6tables for bridge. Network policies and service proxy may not work: %s", err.Error())
 	}
 
 	t := time.NewTicker(nrc.syncPeriod)
@@ -260,7 +246,8 @@ func (nrc *NetworkRoutingController) Run(healthChan chan<- *healthcheck.Controll
 			glog.Errorf("Failed to enable IP forwarding of traffic from pods: %s", err.Error())
 		}
 
-		nrc.enableIptables(netutils.IPTABLES_APPEND_UNIQUE)
+		nrc.enableIptables(netutils.IPTABLES_FULL_CHAIN_SYNC_NO_ORDER)
+		nrc.cleanUpOverlayRules()
 
 		// advertise or withdraw IPs for the services to be reachable via host
 		toAdvertise, toWithdraw, err := nrc.getActiveVIPs()
@@ -288,7 +275,7 @@ func (nrc *NetworkRoutingController) Run(healthChan chan<- *healthcheck.Controll
 		}
 
 		if err == nil {
-			healthcheck.SendHeartBeat(healthChan, "NRC")
+			healthcheck.SendHeartBeat(healthChan, nrc, nil)
 		} else {
 			glog.Errorf("Error during periodic sync in network routing controller. Error: " + err.Error())
 			glog.Errorf("Skipping sending heartbeat from network routing controller as periodic sync failed.")
@@ -319,7 +306,7 @@ func (nrc *NetworkRoutingController) updateCNIConfig() {
 		glog.Fatalf("Failed to get pod CIDR from node spec. kube-router relies on kube-controller-manager to allocate pod CIDR for the node or an annotation `kube-router.io/pod-cidr`. Error: %v", err)
 	}
 
-	if cidr == nil || cidr == currentCidr {
+	if cidr == nil || cidr != currentCidr {
 		err = utils.InsertPodCidrInCniSpec(nrc.cniConfFile, currentCidr.String())
 		if err != nil {
 			glog.Fatalf("Failed to insert `subnet`(pod CIDR) into CNI conf file: %s", err.Error())
@@ -387,11 +374,6 @@ func (nrc *NetworkRoutingController) injectRoute(path *table.Path) error {
 
 	tunnelName := generateTunnelName(nexthop.String())
 	sameSubnet := nrc.nodeSubnet.Contains(nexthop)
-	if !sameSubnet {
-		if str, _ := exec.Command("ip", netutils.NewIP(nexthop).ProtocolCmdParam().Inet, "route", "get", nexthop.String()).Output(); !strings.Contains(string(str), " via ") {
-			sameSubnet = false
-		}
-	}
 
 	// cleanup route and tunnel if overlay is disabled or node is in same subnet and overlay-type is set to 'subnet'
 	if !nrc.enableOverlays || (sameSubnet && nrc.overlayType == "subnet") {
@@ -403,6 +385,9 @@ func (nrc *NetworkRoutingController) injectRoute(path *table.Path) error {
 			glog.Errorf("Failed to get routes from netlink")
 		}
 		for i, r := range routes {
+			if r.Dst.String() == dst.String() && r.Gw.Equal(nexthop) {
+				continue
+			}
 			glog.V(2).Infof("Found route to remove: %s", r.String())
 			if err := netlink.RouteDel(&routes[i]); err != nil {
 				glog.Errorf("Failed to remove route due to " + err.Error())
@@ -415,6 +400,12 @@ func (nrc *NetworkRoutingController) injectRoute(path *table.Path) error {
 				glog.Errorf("Failed to delete tunnel link for the node due to " + err.Error())
 			}
 		}
+	}
+
+	route = &netlink.Route{
+		Dst:      dst,
+		Gw:       nexthop,
+		Protocol: 0x11,
 	}
 
 	// create IPIP tunnels only when node is not in same subnet or overlay-type is set to 'full'
@@ -430,7 +421,7 @@ func (nrc *NetworkRoutingController) injectRoute(path *table.Path) error {
 
 		link, err = netlink.LinkByName(tunnelName)
 		if err != nil {
-			out, err := exec.Command("ip", family, "tunnel", "add", tunnelName, "mode", mode, "local", nrc.nodeIP.String(),
+			out, err := exec.Command(utils.GetPath("ip"), family, "tunnel", "add", tunnelName, "mode", mode, "local", nrc.nodeIP.String(),
 				"remote", nexthop.String(), "dev", nrc.nodeInterface).CombinedOutput()
 			if err != nil {
 				return fmt.Errorf("Route not injected for the route advertised by the node %s "+
@@ -446,37 +437,29 @@ func (nrc *NetworkRoutingController) injectRoute(path *table.Path) error {
 			if err := netlink.LinkSetUp(link); err != nil {
 				return errors.New("Failed to bring tunnel interface " + tunnelName + " up due to: " + err.Error())
 			}
-			// reduce the MTU by 20 bytes to accommodate ipip tunnel overhead
-			if err := netlink.LinkSetMTU(link, link.Attrs().MTU-20); err != nil {
-				return errors.New("Failed to set MTU of tunnel interface " + tunnelName + " up due to: " + err.Error())
-			}
 		} else {
 			glog.Infof("Tunnel interface: " + tunnelName + " for the node " + nexthop.String() + " already exists.")
 		}
 
-		out, err := exec.Command("ip", family, "route", "list", "table", customRouteTableID).CombinedOutput()
+		out, err := exec.Command(utils.GetPath("ip"), family, "route", "list", "table", customRouteTableID).CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("Failed to verify if route already exists in %s table: %s",
 				customRouteTableName, err.Error())
 		}
 		if !strings.Contains(string(out), "dev "+tunnelName) {
-			if out, err = exec.Command("ip", family, "route", "add", nexthop.String(), "dev", tunnelName, "table",
+			if out, err = exec.Command(utils.GetPath("ip"), family, "route", "add", nexthop.String(), "dev", tunnelName, "table",
 				customRouteTableID).CombinedOutput(); err != nil {
 				return fmt.Errorf("failed to add route in custom route table, err: %s, output: %s", err, string(out))
 			}
 		}
+
+		netlink.RouteDel(route)
 
 		route = &netlink.Route{
 			LinkIndex: link.Attrs().Index,
 			Src:       nrc.nodeIP,
 			Dst:       dst,
 			Protocol:  0x11,
-		}
-	} else {
-		route = &netlink.Route{
-			Dst:      dst,
-			Gw:       nexthop,
-			Protocol: 0x11,
 		}
 	}
 
@@ -490,14 +473,11 @@ func (nrc *NetworkRoutingController) injectRoute(path *table.Path) error {
 
 // Cleanup performs the cleanup of configurations done
 func (nrc *NetworkRoutingController) Cleanup() {
-	nrc.ipm.IptablesCleanUp()
+	nrc.Ipm.IptablesCleanUp(podEgressObsoleteChains.RuleContaining...)
 
 	// delete all ipsets created by kube-router
-	ipset, err := netutils.NewIPSet()
-	if err != nil {
-		glog.Errorf("Failed to clean up ipsets: " + err.Error())
-	}
-	err = ipset.Save()
+	ipset := netutils.NewIPSet()
+	err := ipset.Save()
 	if err != nil {
 		glog.Errorf("Failed to clean up ipsets: " + err.Error())
 	}
@@ -508,6 +488,13 @@ func (nrc *NetworkRoutingController) Cleanup() {
 }
 
 func (nrc *NetworkRoutingController) syncNodeIPSets() error {
+	start := time.Now()
+	defer func() {
+		if nrc.MetricsEnabled {
+			metrics.ControllerRoutesSyncTime.Observe(time.Since(start).Seconds())
+		}
+		glog.V(2).Infof("Sync nodeIpSets in network routing controller took %v", time.Since(start))
+	}()
 	// Get the current list of the nodes from API server
 	nodes, err := nrc.clientset.CoreV1().Nodes().List(metav1.ListOptions{})
 	if err != nil {
@@ -561,31 +548,11 @@ func (nrc *NetworkRoutingController) syncNodeIPSets() error {
 	return nil
 }
 
-func (nrc *NetworkRoutingController) newIptablesCmdHandler(forcedProtocol ...netutils.Proto) *iptables.IPTables {
-
-	var protocol netutils.Proto
-	if len(forcedProtocol) == 0 {
-		if nrc.isIpv6 {
-			protocol = netutils.V6
-		} else {
-			protocol = netutils.V4
-		}
-	} else {
-		protocol = forcedProtocol[0]
-	}
-
-	handler, err := iptables.NewWithProtocol(iptables.Protocol(protocol))
-	if err != nil {
-		glog.Fatal("Failed create iptables handler: %s", err.Error())
-	}
-	return handler
-}
-
 func (nrc *NetworkRoutingController) enableIptables(initial netutils.IpTableManipulationType) error {
 	var err error = nil
 
 	// Handle Pod egress masquerading configuration
-	for _, protocol := range netutils.UsedTcpProtocols {
+	for protocol := range netutils.UsedTcpProtocols {
 		if err == nil && nrc.enablePodEgress {
 			err = nrc.createPodEgressRule(protocol, initial)
 		} else if err == nil {
@@ -597,7 +564,7 @@ func (nrc *NetworkRoutingController) enableIptables(initial netutils.IpTableMani
 		}
 	}
 
-	if nrc.isIpv6 {
+	if !netutils.NewIP(nrc.nodeIP).IsIPv4() {
 		if err = nrc.EnableBgpSNAT(initial); err != nil {
 			fmt.Errorf("Failed to setup SNAT for bgp %s", err)
 		}
@@ -607,61 +574,39 @@ func (nrc *NetworkRoutingController) enableIptables(initial netutils.IpTableMani
 }
 
 func (nrc *NetworkRoutingController) EnableBgpSNAT(action netutils.IpTableManipulationType) error {
-	return nrc.ipm.CreateIpTablesRuleWithChain(netutils.V6, "nat", CHAIN_BGP_EGRESS_RULE, action, []string{"POSTROUTING"}, true, netutils.IpTablesRuleListType{
-		&netutils.IpTablesRuleType{"-m", "set", "--match-set", nodeAddrsIPSetName, "dst", "-p", "tcp", "--dport", fmt.Sprint(nrc.bgpPort), "-j", netutils.CHAIN_KUBE_SNAT_TARGET},
-		&netutils.IpTablesRuleType{"-m", "set", "!", "--match-set", nodeAddrsIPSetName, "dst", "-p", "tcp", "--dport", fmt.Sprint(nrc.bgpPort), "-j", netutils.CHAIN_KUBE_SNAT_TARGET},
-	})
+	nrl := &netutils.IpTablesRuleListType{
+		netutils.NewRule("-m", "set", "--match-set", nodeAddrsIPSetName, "dst", "-p", "tcp", "--dport", fmt.Sprint(nrc.bgpPort), "-j", netutils.CHAIN_KUBE_SNAT_TARGET),
+		netutils.NewRule("-m", "set", "!", "--match-set", nodeAddrsIPSetName, "dst", "-p", "tcp", "--dport", fmt.Sprint(nrc.bgpPort), "-j", netutils.CHAIN_KUBE_SNAT_TARGET),
+	}
+
+	return nrc.Ipm.CreateIpTablesRuleWithChain(netutils.V6, "nat", CHAIN_BGP_EGRESS_RULE, action, []string{"POSTROUTING"}, true, nrl)
 }
 
 // ensure there is rule in filter table and FORWARD chain to permit in/out traffic from pods
 // this rules will be appended so that any iptables rules for network policies will take
 // precedence
 func (nrc *NetworkRoutingController) enableForwarding() error {
-	return nrc.ipm.BothTCPProtocolsWrapperNoArg(nrc._enableForwarding)
+	return netutils.UsedTcpProtocols.ForEach(nrc._enableForwarding)
 }
 
-func (nrc *NetworkRoutingController) _enableForwarding(iptablesCmdHandler *iptables.IPTables, protocol netutils.Proto) error {
+func (nrc *NetworkRoutingController) _enableForwarding(p netutils.Proto) error {
+
+	rules := &netutils.IpTablesRuleListType{}
 
 	comment := "allow outbound traffic from pods"
 	args := []string{"-m", "comment", "--comment", comment, "-i", "kube-bridge", "-j", "ACCEPT"}
-	exists, err := iptablesCmdHandler.Exists("filter", "FORWARD", args...)
-	if err != nil {
-		return fmt.Errorf("Failed to run iptables command: %s", err.Error())
-	}
-	if !exists {
-		err := iptablesCmdHandler.Insert("filter", "FORWARD", 1, args...)
-		if err != nil {
-			return fmt.Errorf("Failed to run iptables command: %s", err.Error())
-		}
-	}
+	rules.Add(netutils.NewRule(args...))
 
 	comment = "allow inbound traffic to pods"
 	args = []string{"-m", "comment", "--comment", comment, "-o", "kube-bridge", "-j", "ACCEPT"}
-	exists, err = iptablesCmdHandler.Exists("filter", "FORWARD", args...)
-	if err != nil {
-		return fmt.Errorf("Failed to run iptables command: %s", err.Error())
-	}
-	if !exists {
-		err = iptablesCmdHandler.Insert("filter", "FORWARD", 1, args...)
-		if err != nil {
-			return fmt.Errorf("Failed to run iptables command: %s", err.Error())
-		}
-	}
+	rules.Add(netutils.NewRule(args...))
 
 	comment = "allow outbound node port traffic on node interface with which node ip is associated"
 	args = []string{"-m", "comment", "--comment", comment, "-o", nrc.nodeInterface, "-j", "ACCEPT"}
-	exists, err = iptablesCmdHandler.Exists("filter", "FORWARD", args...)
-	if err != nil {
-		return fmt.Errorf("Failed to run iptables command: %s", err.Error())
-	}
-	if !exists {
-		err = iptablesCmdHandler.Insert("filter", "FORWARD", 1, args...)
-		if err != nil {
-			return fmt.Errorf("Failed to run iptables command: %s", err.Error())
-		}
-	}
+	rules.Add(netutils.NewRule(args...))
 
-	return nil
+	return nrc.Ipm.CreateIpTablesRuleWithChain(p, "filter", netutils.CHAIN_KUBE_COMMON_FORWARD, netutils.IPTABLES_APPEND_UNIQUE,
+		netutils.NoReferencedChains, true, rules)
 }
 
 func (nrc *NetworkRoutingController) startBgpServer() error {
@@ -744,13 +689,19 @@ func (nrc *NetworkRoutingController) startBgpServer() error {
 			LocalAddressList: localAddressList,
 			Port:             int32(nrc.bgpPort),
 		},
+		GracefulRestart: config.GracefulRestart{
+			Config: config.GracefulRestartConfig{
+				Enabled:             true,
+				StaleRoutesTime:     120,
+			},
+		},
 	}
-
-	go nrc.watchBgpUpdates()
 
 	if err := nrc.bgpServer.Start(global); err != nil {
 		return errors.New("Failed to start BGP server due to : " + err.Error())
 	}
+
+	go nrc.watchBgpUpdates()
 
 	g := bgpapi.NewGrpcServer(nrc.bgpServer, netutils.NewIP(nrc.nodeIP).ToStringWithPort("50051")+","+"127.0.0.1:50051")
 	go g.Serve()
@@ -848,7 +799,7 @@ func NewNetworkRoutingController(clientset kubernetes.Interface,
 
 	nrc := NetworkRoutingController{}
 	if kubeRouterConfig.MetricsEnabled {
-		//Register the metrics for this controller
+		//GetData the metrics for this controller
 		prometheus.MustRegister(metrics.ControllerBGPadvertisementsReceived)
 		prometheus.MustRegister(metrics.ControllerBGPInternalPeersSyncTime)
 		prometheus.MustRegister(metrics.ControllerBPGpeers)
@@ -885,10 +836,9 @@ func NewNetworkRoutingController(clientset kubernetes.Interface,
 		return nil, errors.New("Failed getting IP address from node object: " + err.Error())
 	}
 	nrc.nodeIP = nodeIP
-	nrc.isIpv6 = nodeIP.To4() == nil
 
 	bgpLocalAddressListAnnotation, _ := node.ObjectMeta.Annotations[routerID]
-	if "" == nrc.setRouterId(bgpLocalAddressListAnnotation, kubeRouterConfig.RouterId, nrc.nodeIP.String()) && nrc.isIpv6 {
+	if !netutils.NewIP(nrc.nodeIP).IsIPv4() && "" == nrc.setRouterId(bgpLocalAddressListAnnotation, kubeRouterConfig.RouterId, nrc.nodeIP.String()) {
 		return nil, errors.New("Router-id must be specified in ipv6 operation")
 	}
 
@@ -905,10 +855,7 @@ func NewNetworkRoutingController(clientset kubernetes.Interface,
 		}
 	}
 
-	nrc.ipSetHandler, err = netutils.NewIPSet()
-	if err != nil {
-		return nil, err
-	}
+	nrc.ipSetHandler = netutils.NewIPSet()
 
 	_, err = nrc.ipSetHandler.Create(podSubnetsIPSetName, netutils.TypeHashNet, netutils.OptionTimeout, "0")
 	if err != nil {
@@ -970,7 +917,7 @@ func NewNetworkRoutingController(clientset kubernetes.Interface,
 		return nil, fmt.Errorf("Error processing Global Peer Router configs: %s", err)
 	}
 
-	nrc.nodeSubnet, nrc.nodeInterface, err = SearchForBiggerPrefix(nrc.nodeIP)
+	nrc.nodeSubnet, nrc.nodeInterface, err = getLinkAssignedPrefix(nrc.nodeIP)
 	if err != nil {
 		return nil, errors.New("Failed find the subnet of the node IP and interface on" +
 			"which its configured: " + err.Error())
@@ -1000,7 +947,7 @@ func NewNetworkRoutingController(clientset kubernetes.Interface,
 	nrc.nodeLister = nodeInformer.GetIndexer()
 	nrc.NodeEventHandler = nrc.newNodeEventHandler()
 
-	nrc.ipm = netutils.NewIpTablesManager(nrc.localAddressList, podEgressObsoleteChains)
+	nrc.Ipm = netutils.NewIpTablesManager(nrc.localAddressList, podEgressObsoleteChains)
 
 	return &nrc, nil
 }

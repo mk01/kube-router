@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cloudnativelabs/kube-router/pkg/controllers"
 	"github.com/cloudnativelabs/kube-router/pkg/healthcheck"
 	"github.com/cloudnativelabs/kube-router/pkg/options"
 	"github.com/golang/glog"
@@ -17,10 +18,10 @@ import (
 )
 
 const (
-	CONTROLLER_NAME = "Metrics controller"
-
 	namespace = "kube_router"
 )
+
+var CONTROLLER_NAME = []string{"Metrics controller", "MC"}
 
 var (
 	// ServiceTotalConn Total incoming connections made
@@ -149,16 +150,15 @@ var (
 type Controller struct {
 	MetricsPath string
 	MetricsPort uint16
-	mu          sync.Mutex
 	nodeIP      net.IP
 }
 
-func (mc *Controller) GetName() string {
-	return CONTROLLER_NAME
+func (mc *Controller) GetData() ([]string, time.Duration) {
+	return CONTROLLER_NAME, time.Duration(5 * time.Second)
 }
 
 // Run prometheus metrics controller
-func (mc *Controller) Run(healthChan chan<- *healthcheck.ControllerHeartbeat, stopCh <-chan struct{}, wg *sync.WaitGroup) error {
+func (mc *Controller) Run(healthChan chan *controllers.ControllerHeartbeat, stopCh <-chan struct{}, wg *sync.WaitGroup) error {
 	t := time.NewTicker(3 * time.Second)
 	defer wg.Done()
 	glog.Info("Starting metrics controller")
@@ -178,7 +178,7 @@ func (mc *Controller) Run(healthChan chan<- *healthcheck.ControllerHeartbeat, st
 		}
 	}()
 	for {
-		healthcheck.SendHeartBeat(healthChan, "MC")
+		healthcheck.SendHeartBeat(healthChan, mc, nil)
 		select {
 		case <-stopCh:
 			glog.Infof("Shutting down metrics controller")

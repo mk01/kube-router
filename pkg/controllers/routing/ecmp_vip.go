@@ -10,6 +10,7 @@ import (
 	"github.com/golang/glog"
 	"github.com/osrg/gobgp/table"
 	v1core "k8s.io/api/core/v1"
+	types "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"strings"
 )
@@ -220,10 +221,11 @@ func (nrc *NetworkRoutingController) serviceForEndpoints(ep *v1core.Endpoints) (
 
 func (nrc *NetworkRoutingController) getClusterIp(svc *v1core.Service) string {
 	clusterIp := ""
-	if svc.Spec.Type == "ClusterIP" || svc.Spec.Type == "NodePort" || svc.Spec.Type == "LoadBalancer" {
+	if svc.Spec.Type == types.ServiceTypeClusterIP || svc.Spec.Type == types.ServiceTypeNodePort ||
+		svc.Spec.Type == types.ServiceTypeLoadBalancer {
 
 		// skip headless services
-		if svc.Spec.ClusterIP != "None" && svc.Spec.ClusterIP != "" {
+		if svc.Spec.ClusterIP != types.ClusterIPNone && svc.Spec.ClusterIP != "" {
 			clusterIp = svc.Spec.ClusterIP
 		}
 	}
@@ -232,10 +234,10 @@ func (nrc *NetworkRoutingController) getClusterIp(svc *v1core.Service) string {
 
 func (nrc *NetworkRoutingController) getExternalIps(svc *v1core.Service) []string {
 	externalIpList := make([]string, 0)
-	if svc.Spec.Type == "ClusterIP" || svc.Spec.Type == "NodePort" {
+	if svc.Spec.Type == types.ServiceTypeClusterIP || svc.Spec.Type == types.ServiceTypeNodePort {
 
 		// skip headless services
-		if svc.Spec.ClusterIP != "None" && svc.Spec.ClusterIP != "" {
+		if svc.Spec.ClusterIP != types.ClusterIPNone && svc.Spec.ClusterIP != "" {
 			externalIpList = append(externalIpList, svc.Spec.ExternalIPs...)
 		}
 	}
@@ -244,9 +246,9 @@ func (nrc *NetworkRoutingController) getExternalIps(svc *v1core.Service) []strin
 
 func (nrc *NetworkRoutingController) getLoadBalancerIps(svc *v1core.Service) []string {
 	loadBalancerIpList := make([]string, 0)
-	if svc.Spec.Type == "LoadBalancer" {
+	if svc.Spec.Type == types.ServiceTypeLoadBalancer {
 		// skip headless services
-		if svc.Spec.ClusterIP != "None" && svc.Spec.ClusterIP != "" {
+		if svc.Spec.ClusterIP != types.ClusterIPNone && svc.Spec.ClusterIP != "" {
 			for _, lbIngress := range svc.Status.LoadBalancer.Ingress {
 				if len(lbIngress.IP) > 0 {
 					loadBalancerIpList = append(loadBalancerIpList, lbIngress.IP)

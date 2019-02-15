@@ -1,4 +1,4 @@
-FROM alpine:3.7
+FROM alpine:3.9
 
 RUN apk add --no-cache \
       iptables \
@@ -8,6 +8,8 @@ RUN apk add --no-cache \
       ipvsadm \
       conntrack-tools \
       curl \
+      util-linux \
+      libnl libnl3 \
       bash && \
     mkdir -p /var/lib/gobgp && \
     mkdir -p /usr/local/share/bash-completion && \

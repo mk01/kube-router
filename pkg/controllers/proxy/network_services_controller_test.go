@@ -49,8 +49,8 @@ func (lnm *LinuxNetworkingMockImpl) ipvsGetServices() ipvsServiceArrayType {
 func (lnm *LinuxNetworkingMockImpl) ipAddrAdd(iface netlink.Link, ip *net.IPNet, addRoute bool) error {
 	return nil
 }
-func (lnm *LinuxNetworkingMockImpl) ipvsAddServer(ks *KubeService, ep *endpointInfo, update bool) error {
-	return nil
+func (lnm *LinuxNetworkingMockImpl) ipvsAddServer(ks *KubeService, ep *endpointInfo, update bool) (bool, error) {
+	return false, nil
 }
 func (lnm *LinuxNetworkingMockImpl) ipvsAddService(ks *KubeService, update bool) (*libipvs.Service, error) {
 	svc := ks.Service
@@ -66,7 +66,7 @@ func (lnm *LinuxNetworkingMockImpl) ipvsDelService(ks *KubeService) error {
 	}
 	return nil
 }
-func (lnm *LinuxNetworkingMockImpl) ipvsGetDestinations(ipvsSvc *libipvs.Service) ipvsDestinationArrayType {
+func (lnm *LinuxNetworkingMockImpl) ipvsGetDestinations(ipvsSvc *libipvs.Service, force ...bool) ipvsDestinationArrayType {
 	return make(ipvsDestinationArrayType, 0)
 }
 func (lnm *LinuxNetworkingMockImpl) cleanupMangleTableRule(ip string, protocol string, port string, fwmark string) error {

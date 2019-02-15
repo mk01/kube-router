@@ -1,88 +1,65 @@
 package routing
 
 import (
-	"fmt"
-	"io/ioutil"
-	"os"
-	"os/exec"
-	"strings"
-
 	"github.com/cloudnativelabs/kube-router/pkg/utils"
 	"github.com/cloudnativelabs/kube-router/pkg/utils/net-tools"
+	"github.com/golang/glog"
+	"github.com/pkg/errors"
+	"os/exec"
+	"strings"
 )
+
+var customRouteTable netutils.RouteTableMapType
 
 // setup a custom routing table that will be used for policy based routing to ensure traffic originating
 // on tunnel interface only leaves through tunnel interface irrespective rp_filter enabled/disabled
-func (nrc *NetworkRoutingController) enablePolicyBasedRouting() error {
-	err := rtTablesAdd(customRouteTableID, customRouteTableName)
-	if err != nil {
-		return fmt.Errorf("Failed to update rt_tables file: %s", err)
-	}
-
+func (nrc *NetworkRoutingController) setupPolicyBasedRouting(enabled bool) error {
 	cidr, err := utils.GetPodCidrFromNodeSpec(nrc.clientset, nrc.hostnameOverride)
 	if err != nil {
-		return fmt.Errorf("Failed to get the pod CIDR allocated for the node: %s", err.Error())
+		return err
 	}
 
-	out, err := exec.Command("ip", netutils.NewIP(cidr).ProtocolCmdParam().Inet, "rule", "list").Output()
-	if err != nil {
-		return fmt.Errorf("Failed to verify if `ip rule` exists: %s", err.Error())
+	glog.V(1).Infof("IPIP Tunnel Overlay %v in configuration.", enabled)
+	customRouteTable = netutils.RouteTableMapType{
+		customRouteTableName: netutils.RouteTableType{
+			Desc:        "Setting up policy routing required overlays setup.",
+			Id:          customRouteTableID,
+			Name:        customRouteTableName,
+			ForChecking: netutils.RouteTableCheck{Cmd: []string{"rule", "list"}, Output: "lookup " + customRouteTableName},
+			Cmd:         []string{"rule", "add", "from", cidr.String(), "lookup", customRouteTableName},
+			CmdDisable:  []string{"rule", "del", "from", cidr.String(), "lookup", customRouteTableName},
+			ForProto:    netutils.ProtocolsType{netutils.NewIP(cidr).Protocol(): true},
+		},
 	}
-
-	if !strings.Contains(string(out), cidr.String()) {
-		err = exec.Command("ip", netutils.NewIP(cidr).ProtocolCmdParam().Inet, "rule", "add", "from", cidr.String(), "lookup", customRouteTableID).Run()
-		if err != nil {
-			return fmt.Errorf("Failed to add ip rule due to: %s", err.Error())
-		}
-	}
-
-	return nil
+	nrc.rtm = netutils.NewRouteTableManager(&customRouteTable)
+	return nrc.rtm.Setup(enabled)
 }
 
-func (nrc *NetworkRoutingController) disablePolicyBasedRouting() error {
-	err := rtTablesAdd(customRouteTableID, customRouteTableName)
-	if err != nil {
-		return fmt.Errorf("Failed to update rt_tables file: %s", err)
-	}
+func (nrc *NetworkRoutingController) cleanUpOverlayRules() error {
+	return netutils.UsedTcpProtocols.ForEach(nrc.cleanUpOverlayRulesProto)
+}
 
+func (nrc *NetworkRoutingController) cleanUpOverlayRulesProto(protocol netutils.Proto) error {
+	hasError := false
 	cidr, err := utils.GetPodCidrFromNodeSpec(nrc.clientset, nrc.hostnameOverride)
 	if err != nil {
-		return fmt.Errorf("Failed to get the pod CIDR allocated for the node: %s",
-			err.Error())
+		return err
 	}
-
-	out, err := exec.Command("ip", netutils.NewIP(cidr).ProtocolCmdParam().Inet, "rule", "list").Output()
-	if err != nil {
-		return fmt.Errorf("Failed to verify if `ip rule` exists: %s",
-			err.Error())
-	}
-
-	if strings.Contains(string(out), cidr.String()) {
-		err = exec.Command("ip", netutils.NewIP(cidr).ProtocolCmdParam().Inet, "rule", "del", "from", cidr.String(), "table", customRouteTableID).Run()
-		if err != nil {
-			return fmt.Errorf("Failed to delete ip rule: %s", err.Error())
+	out, err := exec.Command(utils.GetPath("ip"), netutils.NewIP(protocol).ProtocolCmdParam().Inet, "rule").CombinedOutput()
+	if err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			rule := strings.Fields(line)
+			if utils.CheckForElementInArray(customRouteTableName, rule) && !utils.CheckForElementInArray(cidr.String(), rule) {
+				if err = exec.Command(utils.GetPath("ip"), netutils.NewIP(protocol).ProtocolCmdParam().Inet, "rule", "del", "pref", rule[0][:len(rule[0])-1]).Run(); err != nil {
+					glog.Errorf("Failed to clean up wrong overlay rule: %s", err.Error())
+					hasError = true
+					continue
+				}
+			}
 		}
 	}
-
-	return nil
-}
-
-func rtTablesAdd(tableNumber, tableName string) error {
-	b, err := ioutil.ReadFile("/etc/iproute2/rt_tables")
-	if err != nil {
-		return fmt.Errorf("Failed to read: %s", err.Error())
+	if hasError {
+		err = errors.New("cleanUpOverlayRulesProto failed")
 	}
-
-	if !strings.Contains(string(b), tableName) {
-		f, err := os.OpenFile("/etc/iproute2/rt_tables", os.O_APPEND|os.O_WRONLY, 0600)
-		if err != nil {
-			return fmt.Errorf("Failed to open: %s", err.Error())
-		}
-		defer f.Close()
-		if _, err = f.WriteString(tableNumber + " " + tableName + "\n"); err != nil {
-			return fmt.Errorf("Failed to write: %s", err.Error())
-		}
-	}
-
-	return nil
+	return err
 }

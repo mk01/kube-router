@@ -28,10 +28,11 @@ func Main() error {
 
 	// Workaround for this issue:
 	// https://github.com/kubernetes/kubernetes/issues/17162
-	flag.CommandLine.Parse([]string{})
-
 	flag.Set("logtostderr", "true")
+	flag.Set("stderrthreshold", "INFO")
 	flag.Set("v", config.VLevel)
+
+	flag.CommandLine.Parse([]string{})
 
 	if config.HelpRequested {
 		pflag.Usage()
