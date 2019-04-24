@@ -8,10 +8,10 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cloudnativelabs/kube-router/pkg/utils"
 	"github.com/cloudnativelabs/kube-router/pkg/utils/net-tools"
 	"github.com/osrg/gobgp/config"
 	"github.com/osrg/gobgp/packet/bgp"
-	"github.com/cloudnativelabs/kube-router/pkg/utils"
 )
 
 // Used for processing Annotations that may contain multiple items

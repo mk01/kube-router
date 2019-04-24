@@ -21,12 +21,15 @@ type IqIp struct {
 	error    error
 }
 
-func NewList(ips []string) []*net.IPNet {
-	var out []*net.IPNet
+func NewList(ips []string) (out []*net.IPNet) {
+	var iqIp *IqIp
 	for _, ip := range ips {
-		out = append(out, NewIP(ip).ToIPNet())
+		iqIp = NewIP(ip)
+		if iqIp.error == nil {
+			out = append(out, iqIp.ToIPNet())
+		}
 	}
-	return out
+	return
 }
 
 func NewIP(in interface{}) *IqIp {
@@ -72,7 +75,7 @@ func (xip *IqIp) fromCIDR(addr string) error {
 	ip, ipnet, err := net.ParseCIDR(addr)
 	if err != nil {
 		xip.error = err
-		return fmt.Errorf("Can't get address %s", err)
+		return fmt.Errorf("can't parse string %s", err)
 	}
 
 	xip.addr.IP = ip
@@ -187,7 +190,7 @@ func (xip *IqIp) Family() uint16 {
 
 type IpCmdParams struct {
 	Inet, Mode, IptCmd, IcmpStr, TunnelProto string
-	ReduceMTU int
+	ReduceMTU                                int
 }
 
 func (xip *IqIp) ProtocolCmdParam() *IpCmdParams {
@@ -202,9 +205,11 @@ func (xip *IqIp) Contains(in interface{}) bool {
 	case *IqIp:
 		return xip.addr.Contains(check.ToIP())
 	case net.IP:
-		return xip.Contains(NewIP(check))
+		return xip.addr.Contains(check)
 	case *net.IP:
-		return xip.Contains(NewIP(check))
+		return xip.addr.Contains(*check)
+	case *net.IPNet:
+		return xip.addr.Contains(check.IP)
 	}
 	return false
 }

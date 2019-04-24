@@ -9,13 +9,8 @@ import (
 	"strings"
 
 	"github.com/cloudnativelabs/kube-router/pkg/utils"
-	"github.com/golang/glog"
 	"github.com/coreos/go-iptables/iptables"
-)
-
-var (
-	// Error returned when ipset binary is not found.
-	errIpsetNotFound = errors.New("Ipset utility not found")
+	"github.com/golang/glog"
 )
 
 const (
@@ -132,7 +127,7 @@ type asyncRequestType struct {
 	extraOptions []string
 }
 
-type asyncDataChannelType struct{
+type asyncDataChannelType struct {
 	fn func(*asyncRequestType) error
 	*asyncRequestType
 }
@@ -141,7 +136,7 @@ var asyncDataChannel chan asyncDataChannelType
 
 func init() {
 	ipSetPath = utils.GetPath("ipset")
-	asyncDataChannel = make(chan asyncDataChannelType, 1500)
+	asyncDataChannel = make(chan asyncDataChannelType, 50)
 	go backgroundWorker()
 }
 
@@ -358,18 +353,19 @@ func (ipset *IPSet) DestroyAllWithin() error {
 // IsActive checks if a set exists on the system with the same name.
 func (set *Set) IsActive(p Proto) (exists bool, err error) {
 	if _, err = set.Parent.run(0, "list", "-name", set.name(p)); err != nil &&
-		!strings.Contains(err.Error(), "name does not exist") {
+		!strings.Contains(err.Error(), "does not exist") {
 		return false, err
 	}
 	return err == nil, nil
 }
 
-func (set *Set) Create() error {
-	for p := range set.getActiveProtocols() {
+func (set *Set) Create() (err error) {
+	err = set.getActiveProtocols().ForEach(func(p Proto) error {
 		if is, err := set.createForProto(p, true); !is || err != nil {
 			return err
 		}
-	}
+		return nil
+	})
 	if set.isManual {
 		return nil
 	}
@@ -403,7 +399,7 @@ func (set *Set) createUnionSet() (err error) {
 		create = true
 		IptablesCleanRule(handler, V4, IpTablesCleanupRuleType{RuleContaining: []string{set.Name}}, true)
 		if _, err = set.Parent.run(0, "destroy", set.Name); err != nil {
-			return fmt.Errorf("Incompatible ipset type found for \"%s\" and set can't by recreated - manual cleanup needed.", set.Name)
+			return fmt.Errorf("incompatible ipset type found for \"%s\" and set can't by recreated - manual cleanup needed", set.Name)
 		}
 	}
 	if create {
@@ -418,11 +414,18 @@ func (set *Set) createUnionSet() (err error) {
 	return err
 }
 
-func (set *Set) getActiveProtocols() ProtocolsType {
+func (set *Set) getActiveProtocols() ProtocolMapType {
+	pt := ProtocolMapType{}
 	if set.isManual {
-		return ProtocolsType{Vmanual: true}
+		return ProtocolMapType{Vmanual: true}
 	}
-	return UsedTcpProtocols
+	for key := range set.Entries {
+		pt[key] = true
+	}
+	if len(pt) == 0 {
+		return ProtocolMapType{V6: true, V4: true}
+	}
+	return pt
 }
 
 func getSystemName(p Proto, name string) string {
@@ -529,12 +532,12 @@ func (set *Set) buildIPSetRestore(buf *bytes.Buffer) *bytes.Buffer {
 // it takes the method as parameter and runs it for both protocol families, with
 // adapted setName (name prefix) or options ( inet/inet6 family opt )
 func (set *Set) perProtoMethodWrapper(f func(Proto, ...interface{}) error, args ...interface{}) (err error) {
-	for p := range set.getActiveProtocols() {
+	return set.getActiveProtocols().ForEach(func(p Proto) error {
 		if err = f(p, args...); err != nil {
 			return err
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 // Save the given set, or all sets if none is given to stdout in a format that
@@ -743,17 +746,21 @@ func backgroundWorker() {
 	for {
 		for data := range asyncDataChannel {
 			if err := data.fn(data.asyncRequestType); err != nil {
-				glog.Errorf("Failed to refresh %s: %s", data.set.Name, err)
+				glog.Errorf("Failed to update %s: %s", data.set.Name, err)
 			}
 		}
 	}
 }
 
 func (set *Set) RefreshAsync(entries interface{}, extraOptions ...string) {
-	asyncDataChannel <- asyncDataChannelType{set._refresh,
-		&asyncRequestType{set, entries, extraOptions}}
+	if set != nil {
+		asyncDataChannel <- asyncDataChannelType{set._refresh,
+			&asyncRequestType{set, entries, extraOptions}}
+	}
 }
 
 func (set *Set) DestroyAsync() {
-	asyncDataChannel <- asyncDataChannelType{set.Destroy, nil}
+	if set != nil {
+		asyncDataChannel <- asyncDataChannelType{set.Destroy, nil}
+	}
 }

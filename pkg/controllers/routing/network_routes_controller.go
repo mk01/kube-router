@@ -689,12 +689,6 @@ func (nrc *NetworkRoutingController) startBgpServer() error {
 			LocalAddressList: localAddressList,
 			Port:             int32(nrc.bgpPort),
 		},
-		GracefulRestart: config.GracefulRestart{
-			Config: config.GracefulRestartConfig{
-				Enabled:             true,
-				StaleRoutesTime:     120,
-			},
-		},
 	}
 
 	if err := nrc.bgpServer.Start(global); err != nil {

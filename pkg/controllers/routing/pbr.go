@@ -28,7 +28,7 @@ func (nrc *NetworkRoutingController) setupPolicyBasedRouting(enabled bool) error
 			ForChecking: netutils.RouteTableCheck{Cmd: []string{"rule", "list"}, Output: "lookup " + customRouteTableName},
 			Cmd:         []string{"rule", "add", "from", cidr.String(), "lookup", customRouteTableName},
 			CmdDisable:  []string{"rule", "del", "from", cidr.String(), "lookup", customRouteTableName},
-			ForProto:    netutils.ProtocolsType{netutils.NewIP(cidr).Protocol(): true},
+			ForProto:    netutils.ProtocolMapType{netutils.NewIP(cidr).Protocol(): true},
 		},
 	}
 	nrc.rtm = netutils.NewRouteTableManager(&customRouteTable)

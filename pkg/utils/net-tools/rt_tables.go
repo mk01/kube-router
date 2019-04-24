@@ -23,7 +23,7 @@ type RouteTableType struct {
 	Cmd         []string
 	ForChecking RouteTableCheck
 	CmdDisable  []string
-	ForProto    ProtocolsType
+	ForProto    ProtocolMapType
 }
 
 type RouteTableMapType map[string]RouteTableType

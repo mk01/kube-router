@@ -7,9 +7,9 @@ import (
 	"github.com/golang/glog"
 	"github.com/google/go-cmp/cmp"
 	"hash/fnv"
+	"net"
 	"os/exec"
 	"strings"
-	"net"
 )
 
 type ApiTransaction struct {

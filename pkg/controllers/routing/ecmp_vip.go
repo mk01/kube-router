@@ -9,8 +9,8 @@ import (
 	"github.com/cloudnativelabs/kube-router/pkg/utils/net-tools"
 	"github.com/golang/glog"
 	"github.com/osrg/gobgp/table"
-	v1core "k8s.io/api/core/v1"
 	types "k8s.io/api/core/v1"
+	v1core "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"strings"
 )

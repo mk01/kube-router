@@ -36,7 +36,7 @@ type IpTableManipulationType int
 type IpTablesManager struct {
 	chainsToCleanUp  []string
 	localAddressList []string
-	ipTablesHandler map[Proto]*iptables.IPTables
+	ipTablesHandler  map[Proto]*iptables.IPTables
 }
 
 type IpTablesCleanupRuleType struct {
@@ -44,7 +44,7 @@ type IpTablesCleanupRuleType struct {
 	InChain        string
 }
 
-type ProtocolsType map[Proto]bool
+type ProtocolMapType map[Proto]bool
 
 type ChainToRuleListMapType map[string]*IpTablesRuleListType
 
@@ -69,12 +69,12 @@ var defaultTables = []string{"filter", "nat", "mangle"}
 var NoReferencedChains = make([]string, 0)
 var EmptyIpTablesRuleListType = &IpTablesRuleListType{}
 
-var UsedTcpProtocols = ProtocolsType{V4: true, V6: true}
+var UsedTcpProtocols = ProtocolMapType{V4: true, V6: true}
 
 var ipmLock *utils.ChannelLockType
 
 func init() {
-	ipmLock = utils.NewChanLock(1)
+	ipmLock = utils.NewChanLock(2)
 }
 
 func NewIpTablesManager(localAddressList []string, cleanupChainsOnStartup ...IpTablesCleanupRuleType) *IpTablesManager {
@@ -373,13 +373,13 @@ func (rl *IpTablesRuleListType) String() (out string) {
 	return
 }
 
-func (pl *ProtocolsType) Merge(apply *ProtocolsType) {
+func (pl *ProtocolMapType) Merge(apply *ProtocolMapType) {
 	for proto := range *apply {
 		(*pl)[proto] = true
 	}
 }
 
-func (pl ProtocolsType) ForEach(fn func(Proto) error) error {
+func (pl ProtocolMapType) ForEach(fn func(Proto) error) error {
 	for proto := range pl {
 		if err := fn(proto); err != nil {
 			return err
@@ -388,13 +388,13 @@ func (pl ProtocolsType) ForEach(fn func(Proto) error) error {
 	return nil
 }
 
-func (pl ProtocolsType) ForEachWithLock(fn func(Proto) error) error {
+func (pl ProtocolMapType) ForEachWithLock(fn func(Proto) error) error {
 	ipmLock.Lock()
 	defer ipmLock.Unlock()
 	return pl.ForEach(fn)
 }
 
-func (pl ProtocolsType) ForEachCreateRulesWithChain(ipm *IpTablesManager, table string, chain string, action IpTableManipulationType,
+func (pl ProtocolMapType) ForEachCreateRulesWithChain(ipm *IpTablesManager, table string, chain string, action IpTableManipulationType,
 	referenceIn []string, logError bool, rules interface{}) (err error, processedRules int) {
 
 	ipmLock.Lock()
@@ -419,11 +419,6 @@ func (pl ProtocolsType) ForEachCreateRulesWithChain(ipm *IpTablesManager, table 
 		}
 	}
 
-	for proto := range UsedTcpProtocols {
-		if !pl[proto] {
-			ipm.createIpTablesRuleWithChain(proto, table, chain, action, NoReferencedChains, logError, &IpTablesRuleListType{})
-		}
-	}
 	return
 }
 
