@@ -957,7 +957,7 @@ func (npc *NetworkPolicyController) evalPodPeer(policy *networking.NetworkPolicy
 }
 
 func (npc *NetworkPolicyController) ListPodInfoByNamespaceAndLabels(namespace string, selector labels.Selector) *podListType {
-	matchingPods := podListType{podsProtocols: netutils.ProtocolMapType{}, pods: &podListMapType{}}
+	matchingPods := podListType{podsProtocols: netutils.ProtocolMapType{}, portNameToPort: &nameToPortType{}, pods: &podListMapType{}}
 	for _, namespacePod := range npc.ListPodsByNamespaceAndLabels(namespace, selector) {
 		if namespacePod.Status.PodIP != "" {
 			podInfo := podInfo{}.fromApi(namespacePod)
@@ -969,9 +969,19 @@ func (npc *NetworkPolicyController) ListPodInfoByNamespaceAndLabels(namespace st
 			}
 
 			podInfo.ip = append(podInfo.ip, netutils.NewList(npc.getExternalIP(podInfo.ip[0].IP, namespace))...)
+
+			npc.getPortNameToPortMap(matchingPods.portNameToPort, namespacePod)
 		}
 	}
 	return &matchingPods
+}
+
+func (npc *NetworkPolicyController) getPortNameToPortMap(out *nameToPortType, pod *api.Pod) {
+	for _, container := range pod.Spec.Containers {
+		for _, port := range container.Ports {
+			(*out)[port.Name] = port.ContainerPort
+		}
+	}
 }
 
 func (npc *NetworkPolicyController) ListPodsByNamespaceAndLabels(namespace string, selector labels.Selector) (ret []*api.Pod) {

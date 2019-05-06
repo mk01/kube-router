@@ -4,11 +4,11 @@ import (
 	"fmt"
 
 	"github.com/cloudnativelabs/kube-router/pkg/utils/net-tools"
-	"github.com/golang/glog"
 	api "k8s.io/api/core/v1"
 	networking "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"net"
 	"time"
 )
@@ -65,9 +65,12 @@ type protocolAndPortListType []*protocolAndPort
 
 type podListMapType map[infoMapsKeyType]*podInfo
 
+type nameToPortType map[string]int32
+
 type podListType struct {
 	podsProtocols  netutils.ProtocolMapType
 	pods           *podListMapType
+	portNameToPort *nameToPortType
 	hasPodsLocally bool
 }
 
@@ -216,10 +219,10 @@ func (prl *networkPolicyListType) Get() *networkPolicyListType {
 	return prl
 }
 
-func (pr *policyRuleEgress) parseEgressPolicy(policy *networking.NetworkPolicy, peerEvaluator EvalPodPeer) (skip bool) {
+func (pr *policyRuleEgress) parseEgressPolicy(policy *networking.NetworkPolicy, peerEvaluator EvalPodPeer, targetPods *podListType) (skip bool) {
 	for _, egress := range policy.Spec.Egress {
 		data := networkPolicyType{}
-		if data.parsePolicyPorts(egress.Ports, policy) || data.parsePolicyPeers(egress.To, policy, peerEvaluator) {
+		if data.parsePolicyPorts(egress.Ports, policy, targetPods) || data.parsePolicyPeers(egress.To, policy, peerEvaluator) {
 			return true
 		}
 		pr.Add(&data)
@@ -227,10 +230,10 @@ func (pr *policyRuleEgress) parseEgressPolicy(policy *networking.NetworkPolicy, 
 	return
 }
 
-func (pr *policyRuleIngress) parseIngressPolicy(policy *networking.NetworkPolicy, peerEvaluator EvalPodPeer) (skip bool) {
+func (pr *policyRuleIngress) parseIngressPolicy(policy *networking.NetworkPolicy, peerEvaluator EvalPodPeer, targetPods *podListType) (skip bool) {
 	for _, ingress := range policy.Spec.Ingress {
 		data := networkPolicyType{}
-		if data.parsePolicyPorts(ingress.Ports, policy) || data.parsePolicyPeers(ingress.From, policy, peerEvaluator) {
+		if data.parsePolicyPorts(ingress.Ports, policy, targetPods) || data.parsePolicyPeers(ingress.From, policy, peerEvaluator) {
 			return true
 		}
 		pr.Add(&data)
@@ -239,8 +242,8 @@ func (pr *policyRuleIngress) parseIngressPolicy(policy *networking.NetworkPolicy
 }
 
 func (npi *networkPolicyInfo) parsePolicy(policy *networking.NetworkPolicy, peerEvaluator EvalPodPeer) (skip bool) {
-	return npi.egressRules.parseEgressPolicy(policy, peerEvaluator) ||
-		npi.ingressRules.parseIngressPolicy(policy, peerEvaluator)
+	return npi.egressRules.parseEgressPolicy(policy, peerEvaluator, npi.targetPods) ||
+		npi.ingressRules.parseIngressPolicy(policy, peerEvaluator, npi.targetPods)
 }
 
 type protocolAndPort struct {
@@ -252,14 +255,14 @@ func (npt PolicyType) CheckFor(check PolicyType) bool {
 	return npt&check == check
 }
 
-func (pr *networkPolicyType) parsePolicyPorts(ports []networking.NetworkPolicyPort, policy *networking.NetworkPolicy) (skip bool) {
+func (pr *networkPolicyType) parsePolicyPorts(ports []networking.NetworkPolicyPort, policy *networking.NetworkPolicy, targetPods *podListType) (skip bool) {
 	// If this field is empty or missing in the spec, this rule matches all ports
-	if err := pr.checkForNamedPorts(&ports); err != nil {
-		glog.Errorf("%s/%s - Skipping processing network policy as its unspported yet: %s", policy.Namespace, policy.Name, err.Error())
-		return true
-	}
 	for _, port := range ports {
-		protocolAndPort := newProtocolAndPort(&port)
+		var protocolAndPort *protocolAndPort
+		if port.Port != nil && port.Port.Type == intstr.String {
+			*port.Port = intstr.FromInt(int((*targetPods.portNameToPort)[port.Port.StrVal]))
+		}
+		protocolAndPort = newProtocolAndPort(&port)
 		pr.GetPorts().Add(protocolAndPort)
 	}
 	return
