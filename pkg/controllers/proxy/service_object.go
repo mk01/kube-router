@@ -19,11 +19,7 @@ import (
 func (nsc *NetworkServicesController) newServiceObject(oso *serviceObject) *serviceObject {
 	var so = new(serviceObject)
 	so.meta = oso.meta
-	so.ksvc = &KubeService{Service: &libipvs.Service{}, ln: nsc.ln}//, lt: LINKED_SERVICE_NOTLINKED}
-	//so.ksvc.AtomicUsage.funcOnZero = func() {
-	//	so.linkedServices[so.ksvc.lt].remove(so.ksvc)
-	//	so.ksvc.destroy()
-	//}
+	so.ksvc = &KubeService{Service: &libipvs.Service{}, ln: nsc.ln}
 	so.linkedServices = make(linkedServiceListMapType)
 	so.linkedServices.init()
 	so.info = new(serviceInfo)
@@ -93,12 +89,35 @@ func (eps *endpointInfoMapType) Size() int {
 	return len(*eps)
 }
 
+func (eps *endpointInfoMapType) Add(ep *endpointInfo) (bool, *endpointInfo) {
+	var id = generateId(ep)
+
+	if (*eps)[id] != nil {
+		currentEp := (*eps)[id]
+		if currentEp.Weight != ep.Weight {
+			currentEp.change = SYNCH_CHANGED
+		} else {
+			currentEp.change = SYNCH_NO_CHANGE
+		}
+		currentEp.Destination = ep.Destination
+		return true, currentEp
+	}
+
+	ep.UsageLockType = &UsageLockType{used: make(map[infoMapsKeyType]bool), runOnNoReferences: func() {
+		ep.so.destroy(ep)
+	}}
+	(*eps)[id] = ep
+	(*eps)[id].hash = id
+
+	return false, (*eps)[id]
+}
+
 func (so *serviceObject) updateIpvs(changed ...synchChangeType) {
 	so.endpoints.forEach(func(ep *endpointInfo) {
 		if ep.Weight == 0 {
 			return
 		}
-		ch := ep.change.mergeChange(changed...).mergeChange(so.meta.change)
+		ch := ep.change.mergeChange(changed...)
 
 		if ch.CheckFor(SYNCH_NEW) || ch.CheckFor(SYNCH_CHANGED) {
 			so.iterateOver(ep.attach, ch)
@@ -111,7 +130,7 @@ func (so *serviceObject) updateIpvs(changed ...synchChangeType) {
 }
 
 func (so *serviceObject) hasActiveEndpoints() bool {
-	return so.getEps().Size() != 0
+	return so.endpoints.Size() != 0
 }
 
 func (so *serviceObject) getEps() (eps *endpointInfoMapType) {
@@ -125,7 +144,7 @@ func (so *serviceObject) deployService(chng ...synchChangeType) {
 		return
 	}
 
-	if !change.CheckFor(SYNCH_CHANGED) && !change.CheckFor(SYNCH_NEW) {
+	if !change.CheckFor(SYNCH_CHANGED) && !change.CheckFor(SYNCH_NEW) && !change.CheckFor(SYNCH_NOT_FOUND) {
 		return
 	}
 
@@ -149,8 +168,6 @@ func (so *serviceObject) linkService(old *kubeServiceArrayType, ip *net.IPNet, i
 	var err error
 	var create = true
 
-
-	//if lType != LINKED_SERVICE_NOTLINKED {
 	newksvc := so.ksvc.clone(ip, isFWMark, lType, so)
 	if i := old.isPresent(newksvc); i != -1 {
 		ksvc = (*old)[i]
@@ -159,13 +176,9 @@ func (so *serviceObject) linkService(old *kubeServiceArrayType, ip *net.IPNet, i
 	} else {
 		ksvc = newksvc
 	}
-//}
-		/* else {
-		ksvc = so.ksvc
-	}*/
 
 	if err = ksvc.deploy(create || so.meta.change.CheckFor(SYNCH_NEW)); err != nil {
-		glog.Errorf("Create: %v, failed %s, Object: %v\nService Object:",  err.Error(), so, old)
+		glog.Errorf("Create: %v, failed %s, Object: %v\nService Object:", err.Error(), so, old)
 		return
 	}
 
@@ -174,6 +187,26 @@ func (so *serviceObject) linkService(old *kubeServiceArrayType, ip *net.IPNet, i
 	if !utils.CheckForElementInArray(netutils.NewIP(ksvc.Address).ToIPNet(), so.getNodeportIPs()) {
 		ksvc.updateLinkAddr(NL_ADDR_ADD, true)
 	}
+}
+
+func (so *serviceObject) markEndpoints(withMark synchChangeType) {
+	var toRemove = make([]*endpointInfo, 0)
+	so.getEps().forEach(func(ep *endpointInfo) {
+		if ep.Weight == 0 {
+			return
+		}
+		if withMark == SYNCH_NOT_FOUND && ep.change.CheckFor(withMark) {
+			toRemove = append(toRemove, ep)
+			return
+		}
+		ep.change = withMark
+	})
+
+	so.epLock.Lock()
+	for i := range toRemove {
+		delete(*so.endpoints, toRemove[i].hash)
+	}
+	so.epLock.Unlock()
 }
 
 func (ep *endpointInfo) detach(ks *KubeService, update synchChangeType, fs ...postActionFunctionType) {
@@ -185,12 +218,12 @@ func (ep *endpointInfo) detach(ks *KubeService, update synchChangeType, fs ...po
 }
 
 func (ep *endpointInfo) attach(ks *KubeService, update synchChangeType, fs ...postActionFunctionType) {
-	if upd, err := ks.attachDestination(ep); err == nil && (ep.change.CheckFor(SYNCH_NEW) || ep.change.CheckFor(SYNCH_NEW) && !upd) {
+	if upd, err := ks.attachDestination(ep); err == nil && (!upd || ep.change.CheckFor(SYNCH_NEW)) {
 		for _, f := range fs {
 			f(ep, ks, NL_ADDR_ADD)
 		}
-		ep.Lock(ep.String())
-		ks.Lock(ks.String())
+		ep.Lock(ep.String(), ks.ipvsHash)
+		ks.Lock(ks.String(), ep.hash)
 	}
 }
 
@@ -232,7 +265,7 @@ func (so *serviceObject) destroy(ep *endpointInfo) {
 	if ep.connTrack {
 		ep.purgeConntrackRecords()
 	}
-	id := generateId(ep)
+	id := ep.hash
 	(*so.endpoints)[id] = nil
 	delete(*so.endpoints, id)
 }

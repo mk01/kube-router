@@ -17,7 +17,7 @@ import (
 	"github.com/cloudnativelabs/kube-router/pkg/utils/net-tools"
 	"github.com/golang/glog"
 	"github.com/google/go-cmp/cmp"
-	"sync/atomic"
+	"sync"
 )
 
 const (
@@ -100,7 +100,6 @@ type linkedServiceListType []linkedServiceType
 
 var allEndpointTypes = linkedServiceListType{LINKED_SERVICE_EXTERNALIP, LINKED_SERVICE_NODEPORT, LINKED_SERVICE_NOTLINKED}
 
-var DeepComparerIpvsDestination = cmp.Comparer(DeepCompareDestination)
 var ComparerIpvsDestination = cmp.Comparer(CompareEndpointDestination)
 var ComparerKubeService = cmp.Comparer(CompareKubeService)
 
@@ -169,7 +168,7 @@ func (sc synchChangeType) String() string {
 
 func (ep *endpointInfo) String() string {
 	return fmt.Sprintf("addr: %s, locks: %d, change: %s",
-		netutils.NewIP(ep.Address).ToStringWithPort(fmt.Sprint(ep.Port)), atomic.LoadUint32(&ep.used), ep.change.String())
+		netutils.NewIP(ep.Address).ToStringWithPort(fmt.Sprint(ep.Port)), len(ep.used), ep.change.String())
 }
 
 func (km keyMetrics) String() string {
@@ -239,8 +238,7 @@ func (ks *KubeService) isFwMarkService() bool {
 }
 
 func (ks *KubeService) clone(ip *net.IPNet, isFWMark bool, lt linkedServiceType, so *serviceObject) *KubeService {
-	var used uint32 = 0
-	clonedKs := &KubeService{Service: &libipvs.Service{}, ln: ks.ln, lt: lt, UsageLockType: &UsageLockType{used:used}}
+	clonedKs := &KubeService{Service: &libipvs.Service{}, ln: ks.ln, lt: lt}
 	ipvsSvc := *ks.Service
 	clonedKs.Service = &ipvsSvc
 
@@ -257,16 +255,16 @@ func (ks *KubeService) clone(ip *net.IPNet, isFWMark bool, lt linkedServiceType,
 		clonedKs.FWMark = uint32(clonedKs.ipvsHash)
 	}
 
-	clonedKs.UsageLockType.funcOnZero = func() {
+	clonedKs.UsageLockType = &UsageLockType{used: make(map[infoMapsKeyType]bool), runOnNoReferences: func() {
 		so.linkedServices[lt].remove(clonedKs)
 		clonedKs.destroy()
-	}
+	}}
 
 	return clonedKs
 }
 
 func (ks *KubeService) deploy(new bool) error {
-	_, err := ks.ln.ipvsAddService(ks, new || atomic.LoadUint32(&ks.used) == 0)
+	_, err := ks.ln.ipvsAddService(ks, new || len(ks.used) == 0)
 	return err
 }
 
@@ -302,8 +300,9 @@ func (ks *KubeService) attachDestination(ep *endpointInfo) (upd bool, err error)
 func (ks *KubeService) detachDestination(ep *endpointInfo) (err error) {
 	if _, dst := ks.refreshEp(ep); dst != nil && dst.Weight != 0 {
 		ks.softDeregister(ep)
-	} else {
-		glog.Errorf(" Error delete destination:: %s - %s", ep.String(), err.Error())
+	} else if dst == nil {
+		err = fmt.Errorf(" Error delete destination: %s", ep.String())
+		glog.Error(err)
 	}
 	return
 }
@@ -315,12 +314,15 @@ func (ks *KubeService) purgeDestination(ep *endpointInfo) (err error) {
 		return
 	}
 	var so = ep.so
-	count := ep.Unlock(ep.String())
-	ks.Unlock(ks.String())
+	count := ep.Unlock(ep.String(), ks.ipvsHash)
+	ks.Unlock(ks.String(), ep.hash)
 	if count == 0 {
 		so.epLock.Unlock()
 	}
-	return
+	if !so.hasActiveEndpoints() {
+		so.meta.change = SYNCH_NOT_FOUND
+	}
+	return nil
 }
 
 func (ks *KubeService) softDeregister(ep *endpointInfo) {
@@ -338,7 +340,7 @@ func (ks *KubeService) putStandbyEp(ep *endpointInfo) (err error) {
 func (ks *KubeService) refreshEp(ep *endpointInfo) (bool, *libipvs.Destination) {
 	dsts := ks.ln.ipvsGetDestinations(ks.Service, true)
 	if ok, i := utils.FindElementInArray(ks.getDestination(ep), dsts, ComparerIpvsDestination); ok {
-		return true, dsts[i]
+		return ep.Weight == 0, dsts[i]
 	}
 	return false, nil
 }
@@ -386,12 +388,14 @@ func watcher() {
 			if time.Since(wo.ts) < graceDownPeriod {
 				continue
 			}
-			if ok, dst := wo.ks.refreshEp(wo.ep); ok && dst.ActiveConns == 0 && dst.InactConns == 0 {
-				if nil == wo.ks.purgeDestination(wo.ep) {
+			if ok, dst := wo.ks.refreshEp(wo.ep); ok && dst.ActiveConns == 0 && dst.InactConns == 0 || !ok {
+				ok = true
+				if dst != nil && dst.Weight == 0 {
+					ok = nil == wo.ks.purgeDestination(wo.ep)
+				}
+				if ok {
 					delete(wos, wo)
 				}
-			} else if !ok {
-				delete(wos, wo)
 			}
 		}
 	}
@@ -475,34 +479,39 @@ func DeepCompareDestination(a, b *libipvs.Destination) bool {
 	return CompareEndpointDestination(a, b) && a.FwdMethod == b.FwdMethod
 }
 
-func CompareService(a, b *libipvs.Service) bool {
-	if (a.FWMark | b.FWMark) != 0 {
-		return a.FWMark == b.FWMark
+func CompareKubeService(a, b *KubeService) bool {
+	if a.ipvsHash == 0 || b.ipvsHash == 0 {
+		panic("ipvsHash field empty while comparing: " + a.String() + " to " + b.String())
 	}
-	return a.Address.Equal(b.Address) && a.Port == b.Port && a.Protocol == b.Protocol
+	return a.Equals(b)
 }
 
-func CompareKubeService(a, b *KubeService) bool {
-	//return a.ipvsHash == b.ipvsHash
-	return CompareService(a.Service, b.Service)
+func (ks *KubeService) Equals(eqTo *KubeService) bool {
+	return ks.ipvsHash == eqTo.ipvsHash
 }
 
 type UsageLockType struct {
-	used        uint32
-	funcOnZero  func()
+	sync.Mutex
+	used              map[infoMapsKeyType]bool
+	runOnNoReferences func()
 }
 
-func (lk *UsageLockType) Lock(id string) uint32 {
-	count := atomic.AddUint32(&lk.used, uint32(1))
-	fmt.Println("Lock: ", id, " ==", count)
-	return count
+func (lk *UsageLockType) Lock(id string, key infoMapsKeyType) (count int) {
+	lk.Mutex.Lock()
+	lk.used[key] = true
+	count = len(lk.used)
+	glog.V(1).Info("lock: ", id, " == ", count)
+	lk.Mutex.Unlock()
+	return
 }
 
-func (lk *UsageLockType) Unlock(id string) uint32 {
-	count := atomic.AddUint32(&lk.used, ^uint32(0))
-	if count == 0 && lk.funcOnZero != nil {
-		lk.funcOnZero()
+func (lk *UsageLockType) Unlock(id string, key infoMapsKeyType) (count int) {
+	lk.Mutex.Lock()
+	delete(lk.used, key)
+	if count = len(lk.used); count == 0 && lk.runOnNoReferences != nil {
+		lk.runOnNoReferences()
 	}
-	fmt.Println("unlock: ", id, " ==", count)
-	return count
+	glog.V(1).Info("unlock: ", id, " == ", count)
+	lk.Mutex.Unlock()
+	return
 }
