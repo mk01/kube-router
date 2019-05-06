@@ -138,7 +138,7 @@ func (kr *KubeRouter) Run() error {
 
 	if kr.Config.RunFirewall {
 		npc, err := netpol.NewNetworkPolicyController(kr.Client,
-			kr.Config, podInformer, npInformer, nsInformer)
+			kr.Config, podInformer, npInformer, nsInformer, epInformer, svcInformer)
 		if err != nil {
 			return errors.New("Failed to create network policy controller: " + err.Error())
 		}

@@ -53,7 +53,7 @@ type networkPolicyMetadata struct {
 
 // internal structure to represent Pod
 type podInfo struct {
-	ip        *net.IPNet
+	ip        []*net.IPNet
 	name      string
 	namespace string
 	uid       infoMapsKeyType
@@ -66,7 +66,7 @@ type protocolAndPortListType []*protocolAndPort
 type podListMapType map[infoMapsKeyType]*podInfo
 
 type podListType struct {
-	podsProtocols  netutils.ProtocolsType
+	podsProtocols  netutils.ProtocolMapType
 	pods           *podListMapType
 	hasPodsLocally bool
 }
@@ -145,7 +145,7 @@ func (ars *activeRecordSets) Add(used string) {
 	ars.at[used] = true
 }
 
-func (ars *activeRecordSets) IsUsed(used string) bool {
+func (ars *activeRecordSets) Contains(used string) bool {
 	return ars.at[used]
 }
 
@@ -205,7 +205,7 @@ func newProtocolAndPort(port *networking.NetworkPolicyPort) *protocolAndPort {
 }
 
 func (pi podInfo) fromApi(pod *api.Pod) *podInfo {
-	pi.ip = netutils.NewIP(pod.Status.PodIP).ToIPNet()
+	pi.ip = []*net.IPNet{netutils.NewIP(pod.Status.PodIP).ToIPNet()}
 	pi.namespace = pod.Namespace
 	pi.name = pod.Name
 	pi.uid = infoMapsKeyType(pod.UID)
