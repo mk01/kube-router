@@ -74,7 +74,7 @@ var UsedTcpProtocols = ProtocolMapType{V4: true, V6: true}
 var ipmLock *utils.ChannelLockType
 
 func init() {
-	ipmLock = utils.NewChanLock(2)
+	ipmLock = utils.NewChanLock(1)
 }
 
 func NewIpTablesManager(localAddressList []string, cleanupChainsOnStartup ...IpTablesCleanupRuleType) *IpTablesManager {
@@ -241,7 +241,7 @@ func (ipm *IpTablesManager) prepareListForActionObsolete(protocol Proto, table, 
 
 		var out []byte
 		if err = ipm.ipTablesHandler[protocol].Delete(table, chain, strings.Fields(rule)[2:]...); err != nil {
-			out, err = exec.Command(NewIP(protocol).ProtocolCmdParam().IptCmd, "-t", table, "-D", chain, fmt.Sprint(i-deleted)).Output()
+			out, err = exec.Command(NewIP(protocol).ProtocolCmdParam().IptCmd, "-t", table, "-D", chain, fmt.Sprint(i-deleted), "-w").CombinedOutput()
 		}
 		if err != nil {
 			glog.Errorf("Can't remove obsolete rule: %s\n%v", err, string(out))
@@ -266,10 +266,10 @@ func (ipm *IpTablesManager) IptablesStartUp(protocol Proto, action IpTableManipu
 
 func (ipm *IpTablesManager) IptablesCleanUp(chains ...string) error {
 	ipm.RecordChainForCleanUp(chains...)
-	return UsedTcpProtocols.ForEach(ipm._iptablesCleanUp)
+	return UsedTcpProtocols.ForEach(ipm.iptablesCleanUp)
 }
 
-func (ipm *IpTablesManager) _iptablesCleanUp(protocol Proto) error {
+func (ipm *IpTablesManager) iptablesCleanUp(protocol Proto) error {
 	for _, chain := range append(ipm.chainsToCleanUp, CHAIN_KUBE_SNAT_TARGET) {
 		ipm.iptablesCleanUpChain(protocol, chain, true, ComparerStd)
 	}
