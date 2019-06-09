@@ -136,7 +136,7 @@ var asyncDataChannel chan asyncDataChannelType
 
 func init() {
 	ipSetPath = utils.GetPath("ipset")
-	asyncDataChannel = make(chan asyncDataChannelType, 50)
+	asyncDataChannel = make(chan asyncDataChannelType, 15)
 	go backgroundWorker()
 }
 

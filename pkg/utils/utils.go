@@ -12,6 +12,8 @@ import (
 	"strings"
 )
 
+var CommonLock *ChannelLockType
+
 type ApiTransaction struct {
 	Old interface{}
 	New interface{}
@@ -35,6 +37,9 @@ var pathsToUtils pathsToUtilsType
 
 func init() {
 	var err error
+
+	CommonLock = NewChanLock(1)
+
 	pathsToUtils = make(map[string]string)
 	for _, util := range []string{"ip", "ip6tables", "iptables", "ipset"} {
 		pathsToUtils[util], err = exec.LookPath(util)
@@ -136,4 +141,24 @@ func NewChanLock(arg ...int) *ChannelLockType {
 	}
 	var ll = make(ChannelLockType, capacity)
 	return &ll
+}
+
+type ControllerSyncLockType struct {
+	*ChannelLockType
+}
+
+func (cl *ControllerSyncLockType) Lock() {
+	CommonLock.Lock()
+	cl.ChannelLockType.Lock()
+}
+
+func (cl *ControllerSyncLockType) Unlock() {
+	cl.ChannelLockType.Unlock()
+	CommonLock.Unlock()
+}
+
+func (cl ControllerSyncLockType) New() *ControllerSyncLockType {
+	clp := &cl
+	clp.ChannelLockType = NewChanLock(1)
+	return &cl
 }

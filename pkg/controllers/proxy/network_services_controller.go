@@ -257,7 +257,7 @@ type NetworkServicesController struct {
 	nodeIP              net.IP
 	nodeHostName        string
 	syncPeriod          time.Duration
-	syncLock            *utils.ChannelLockType
+	syncLock            *utils.ControllerSyncLockType
 	serviceMap          serviceInfoMapType
 	podCidr             string
 	masqueradeAll       bool
@@ -368,12 +368,12 @@ func (nsc *NetworkServicesController) Run(healthChan chan *controllers.Controlle
 		// LVS failover not working with UDP packets https://access.redhat.com/solutions/58653
 		{"net/ipv4/vs/expire_quiescent_template", 1},
 		// https://github.com/kubernetes/kubernetes/pull/71114
-		{"net/ipv4/vs/conn_reuse_mode", 2},
+		{"net/ipv4/vs/conn_reuse_mode", 1},
 		// https://github.com/kubernetes/kubernetes/pull/70530/files
 		{"net/ipv4/conf/all/arp_ignore", 1},
 		// https://github.com/kubernetes/kubernetes/pull/70530/files
 		{"net/ipv4/conf/all/arp_announce", 2},
-		// for conn reuse = 2
+		// for conn reuse
 		{"net/ipv4/vs/sloppy_tcp", 1},
 	}
 
@@ -585,7 +585,7 @@ func (nsc *NetworkServicesController) OnUpdate(oldObj interface{}, newObj interf
 
 	afterPickupOnce.Do(func() {
 		nsc.syncLock.Lock()
-		timer = time.AfterFunc(100*time.Millisecond, nsc.pickupQueue)
+		timer = time.AfterFunc(250*time.Millisecond, nsc.pickupQueue)
 	})
 	updatesQueue <- &utils.ApiTransaction{oldObj, newObj}
 }
@@ -598,8 +598,8 @@ func (nsc *NetworkServicesController) pickupQueue() {
 	for {
 		select {
 		case update := <-updatesQueue:
-			nsc.updateObjects(update.Old, update.New)
 			nrUpdates++
+			nsc.updateObjects(nrUpdates, update.Old, update.New)
 		default:
 			afterPickupOnce = &sync.Once{}
 			if nrUpdates == 0 {
@@ -619,12 +619,12 @@ var updatesQueue chan *utils.ApiTransaction
 func init() {
 	timer = nil
 	afterPickupOnce = &sync.Once{}
-	updatesQueue = make(chan *utils.ApiTransaction, 25)
+	updatesQueue = make(chan *utils.ApiTransaction, 15)
 }
 
-func (nsc *NetworkServicesController) updateObjects(oldObj interface{}, newObj interface{}) {
+func (nsc *NetworkServicesController) updateObjects(i int, oldObj interface{}, newObj interface{}) {
 	start := time.Now()
-	defer glog.V(0).Info("Transaction sync services controller took ", time.Since(start))
+	defer glog.V(0).Infof("Transaction #%d sync services controller took %v", i, time.Since(start))
 
 	switch newTyped := newObj.(type) {
 	case *api.Service:
@@ -1643,7 +1643,7 @@ func NewNetworkServicesController(clientset kubernetes.Interface,
 
 	nsc.serviceMap = make(serviceInfoMapType)
 
-	nsc.syncLock = utils.NewChanLock(1)
+	nsc.syncLock = utils.ControllerSyncLockType{}.New()
 
 	nsc.client = clientset
 

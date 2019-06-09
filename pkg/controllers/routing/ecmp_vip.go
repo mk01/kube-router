@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/cloudnativelabs/kube-router/pkg/utils"
 	"github.com/cloudnativelabs/kube-router/pkg/utils/net-tools"
 	"github.com/golang/glog"
 	"github.com/osrg/gobgp/table"
@@ -77,6 +78,9 @@ func getServiceObject(obj interface{}) (svc *v1core.Service) {
 }
 
 func (nrc *NetworkRoutingController) handleServiceUpdate(svc *v1core.Service) {
+	utils.CommonLock.Lock()
+	defer utils.CommonLock.Unlock()
+
 	if !nrc.bgpServerStarted {
 		glog.V(3).Infof("Skipping update to service: %s/%s, controller still performing bootup full-sync", svc.Namespace, svc.Name)
 		return

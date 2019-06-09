@@ -190,7 +190,11 @@ func (so *serviceObject) linkService(old *kubeServiceArrayType, ip *net.IPNet, i
 }
 
 func (so *serviceObject) markEndpoints(withMark synchChangeType) {
+	so.epLock.Lock()
+	defer so.epLock.Unlock()
+
 	var toRemove = make([]*endpointInfo, 0)
+
 	so.getEps().forEach(func(ep *endpointInfo) {
 		if ep.Weight == 0 {
 			return
@@ -202,11 +206,9 @@ func (so *serviceObject) markEndpoints(withMark synchChangeType) {
 		ep.change = withMark
 	})
 
-	so.epLock.Lock()
 	for i := range toRemove {
 		delete(*so.endpoints, toRemove[i].hash)
 	}
-	so.epLock.Unlock()
 }
 
 func (ep *endpointInfo) detach(ks *KubeService, update synchChangeType, fs ...postActionFunctionType) {

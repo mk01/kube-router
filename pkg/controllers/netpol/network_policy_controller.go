@@ -72,7 +72,7 @@ var (
 type NetworkPolicyController struct {
 	nodeIP          net.IP
 	nodeHostName    string
-	mu              *utils.ChannelLockType
+	mu              *utils.ControllerSyncLockType
 	syncPeriod      time.Duration
 	MetricsEnabled  bool
 	v1NetworkPolicy bool
@@ -107,7 +107,7 @@ var updatesQueue chan *utils.ApiTransaction
 
 func init() {
 	timer = nil
-	updatesQueue = make(chan *utils.ApiTransaction, 25)
+	updatesQueue = make(chan *utils.ApiTransaction, 15)
 	afterPickupOnce = &sync.Once{}
 }
 
@@ -227,13 +227,17 @@ func (npc *NetworkPolicyController) pickupQueue() {
 
 	dummyRecordSet := activeRecordSets{}.New()
 
-	updatePolicies := &networkPolicyInfoListType{}
+	var updatePolicies = &networkPolicyInfoListType{}
 	var updatedPods []interface{}
 	var updatedNamespaces []interface{}
+
+	var grouped = 0
 
 	for {
 		select {
 		case upd := <-updatesQueue:
+			grouped++
+
 			switch updTyped := upd.New.(type) {
 			case *api.Pod:
 				updatedPods = append(updatedPods, podInfo{}.fromApi(updTyped))
@@ -250,6 +254,14 @@ func (npc *NetworkPolicyController) pickupQueue() {
 		default:
 			afterPickupOnce = &sync.Once{}
 
+			updatePolicies.ForEach(func(p *networkPolicyInfo) {
+				npc.syncSingleNetworkPolicyChain(p, dummyRecordSet, dummyRecordSet, true)
+			})
+
+			npc.syncPodFirewallChains(updatePolicies)
+
+			updatePolicies = &networkPolicyInfoListType{}
+
 			if len(updatedPods) > 0 {
 				npc.networkPoliciesInfo.ForEach(func(p *networkPolicyInfo) {
 					p.targetPods = npc.ListPodInfoByNamespaceAndLabels(p.meta.namespace, p.meta.labels.AsSelector())
@@ -258,14 +270,13 @@ func (npc *NetworkPolicyController) pickupQueue() {
 					npc.findAffectedPolicies(p, updatePolicies, updatedPods)
 					npc.findAffectedPolicies(p, updatePolicies, updatedNamespaces)
 				})
+
+				updatePolicies.ForEach(func(p *networkPolicyInfo) {
+					npc.syncSingleNetworkPolicyChain(p, dummyRecordSet, dummyRecordSet, false)
+				})
 			}
 
-			updatePolicies.ForEach(func(p *networkPolicyInfo) {
-				npc.syncSingleNetworkPolicyChain(p, dummyRecordSet, dummyRecordSet)
-			})
-
-			npc.syncPodFirewallChains(updatePolicies)
-			glog.V(0).Infof("Transaction sync policy controller took %v", time.Since(start))
+			glog.V(0).Infof("Transaction sync policy controller took %v (consolidated %d changes)", time.Since(start), grouped)
 
 			npc.cfgCheck.ForceNextRun(npc)
 			return
@@ -390,7 +401,7 @@ func (npc *NetworkPolicyController) syncNetworkPolicyChains() (*activeRecordSets
 
 	// run through all network policies
 	npc.networkPoliciesInfo.ForEach(func(policy *networkPolicyInfo) {
-		if err = npc.syncSingleNetworkPolicyChain(policy, activePolicyIpSets, activePolicyChains); err != nil {
+		if err = npc.syncSingleNetworkPolicyChain(policy, activePolicyIpSets, activePolicyChains, true); err != nil {
 			return
 		}
 	})
@@ -406,7 +417,7 @@ func (npc *NetworkPolicyController) syncNetworkPolicyChains() (*activeRecordSets
 }
 
 func (npc *NetworkPolicyController) syncSingleNetworkPolicyChain(policy *networkPolicyInfo, activePolicyIpSets,
-	activePolicyChains *activeRecordSets) (err error) {
+	activePolicyChains *activeRecordSets, withRules bool) (err error) {
 
 	targetPodIpSetName := kubeTargetIpSetPrefix.GetFromMeta(policy.meta)
 
@@ -429,6 +440,9 @@ func (npc *NetworkPolicyController) syncSingleNetworkPolicyChain(policy *network
 		targetPodIpSet.RefreshAsync(currentPodIps)
 	}
 
+	if !withRules {
+		return
+	}
 	err = npc.processRules(policy, activePolicyChains, activePolicyIpSets)
 	return
 }
@@ -794,7 +808,7 @@ func (npc *NetworkPolicyController) cleanupChains(chainPrefix string, comparer c
 	start := time.Now()
 	defer func() {
 		endTime := time.Since(start)
-		glog.V(0).Infof("Syncing cleanupChains policy chains took %v", endTime)
+		glog.V(0).Infof("Syncing cleanupChains policy chains for prefix %s took %v", chainPrefix, endTime)
 	}()
 
 	netutils.UsedTcpProtocols.ForEach(func(proto netutils.Proto) error {
@@ -833,7 +847,6 @@ func (npc *NetworkPolicyController) cleanupIpSets(activePolicyIPSets *activeReco
 			name = name[:len(name)-1]
 		}
 		if !activePolicyIPSets.Contains(name) {
-			fmt.Println("Destroy:", name)
 			set.DestroyAsync()
 		}
 	}
@@ -1116,7 +1129,8 @@ func (npc *NetworkPolicyController) newPodEventHandler() cache.ResourceEventHand
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			newPoObj := newObj.(*api.Pod)
 			oldPoObj := oldObj.(*api.Pod)
-			if newPoObj.Status.Phase != oldPoObj.Status.Phase || newPoObj.Status.PodIP != oldPoObj.Status.PodIP {
+			if newPoObj.Status.Phase != api.PodPending &&
+				(newPoObj.Status.Phase != oldPoObj.Status.Phase || newPoObj.Status.PodIP != oldPoObj.Status.PodIP) {
 				// for the network policies, we are only interested in pod status phase change or IP change
 				npc.OnPodUpdate(newObj)
 			}
@@ -1224,7 +1238,7 @@ func (npc *NetworkPolicyController) getSvcFromPodIP(podIP net.IP, namespace stri
 // NewNetworkPolicyController returns new NetworkPolicyController object
 func NewNetworkPolicyController(clientset kubernetes.Interface, config *options.KubeRouterConfig,
 	podInformer, npInformer, nsInformer, epInformer, svcInformer cache.SharedIndexInformer) (*NetworkPolicyController, error) {
-	npc := NetworkPolicyController{mu: utils.NewChanLock()}
+	npc := NetworkPolicyController{mu: utils.ControllerSyncLockType{}.New()}
 
 	if config.MetricsEnabled {
 		//GetData the metrics for this controller
