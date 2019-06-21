@@ -226,6 +226,7 @@ func (npc *NetworkPolicyController) pickupQueue() {
 	defer npc.mu.Unlock()
 
 	dummyRecordSet := activeRecordSets{}.New()
+	activePolicyChains := activeRecordSets{}.New()
 
 	var updatePolicies = &networkPolicyInfoListType{}
 	var updatedPods []interface{}
@@ -255,10 +256,10 @@ func (npc *NetworkPolicyController) pickupQueue() {
 			afterPickupOnce = &sync.Once{}
 
 			updatePolicies.ForEach(func(p *networkPolicyInfo) {
-				npc.syncSingleNetworkPolicyChain(p, dummyRecordSet, dummyRecordSet, true)
+				npc.syncSingleNetworkPolicyChain(p, dummyRecordSet, activePolicyChains, true)
 			})
 
-			npc.syncPodFirewallChains(updatePolicies)
+			npc.syncPodFirewallChains(activePolicyChains, updatePolicies)
 
 			updatePolicies = &networkPolicyInfoListType{}
 
@@ -339,7 +340,7 @@ func (npc *NetworkPolicyController) Sync() (err error) {
 		return errors.New("Aborting sync. Failed to sync extra sets: " + err.Error())
 	}
 
-	activePodInChains, activePodOutChains, err := npc.syncPodFirewallChains()
+	activePodInChains, activePodOutChains, err := npc.syncPodFirewallChains(activePolicyChains)
 	if err != nil {
 		return errors.New("Aborting sync. Failed to sync pod firewalls: " + err.Error())
 	}
@@ -516,6 +517,10 @@ func (pr *policyRuleEgress) getTemplate(rt templateType, meta *networkPolicyMeta
 func (prl *networkPolicyListType) processPolicyRules(policy *networkPolicyInfo, policyRule policyRuleType, ipSetHandler *netutils.IPSet,
 	activePolicyChains, activePolicyIpSets *activeRecordSets, ipm *netutils.IpTablesManager) (err error) {
 
+	if policy.targetPods.Size() == 0 {
+		return
+	}
+
 	rules := &netutils.IpTablesRuleListType{}
 	for _, rule := range prl.rules {
 		if err = rule.buildFwRules(policy.meta, policyRule, ipSetHandler, activePolicyIpSets, rules); err != nil {
@@ -523,7 +528,7 @@ func (prl *networkPolicyListType) processPolicyRules(policy *networkPolicyInfo, 
 		}
 	}
 
-	if len(*rules) == 0 {
+	if rules.Size() == 0 {
 		return
 	}
 
@@ -586,7 +591,7 @@ func (pr *networkPolicyType) buildFwRules(meta *networkPolicyMetadata, policyRul
 	return
 }
 
-func (npc *NetworkPolicyController) syncPodFirewallChains(inputPolicy ...*networkPolicyInfoListType) (*activeRecordSets, *activeRecordSets, error) {
+func (npc *NetworkPolicyController) syncPodFirewallChains(activeChains *activeRecordSets, inputPolicy ...*networkPolicyInfoListType) (*activeRecordSets, *activeRecordSets, error) {
 	start := time.Now()
 	defer func() {
 		endTime := time.Since(start)
@@ -654,9 +659,12 @@ func (npc *NetworkPolicyController) syncPodFirewallChains(inputPolicy ...*networ
 		// add entries in pod firewall to run through required network policies
 		for _, policy := range *npc.networkPoliciesInfo {
 			if pol.meta.hash == policy.meta.hash && policy.policyType.CheckFor(NETWORK_POLICY_INGRESS) {
-				podsProtocols.Merge(&policy.targetPods.podsProtocols)
 				comment := "run through nw policy " + policy.meta.name + " " + policyRuleIngress{}.String()
 				policyChainName := kubeNetworkPolicyChainPrefix.Get(policy.meta.namespace, policy.meta.name, policyRuleIngress{}.String())
+				if !activeChains.Contains(policyChainName) {
+					continue
+				}
+				podsProtocols.Merge(&policy.targetPods.podsProtocols)
 				args := []string{"-m", "comment", "--comment", comment, "-j", policyChainName}
 				podOwnChain[podFwChainName].Add(netutils.NewRule(args...))
 			}
@@ -724,9 +732,12 @@ func (npc *NetworkPolicyController) syncPodFirewallChains(inputPolicy ...*networ
 		// add entries in pod firewall to run through required network policies
 		for _, policy := range *npc.networkPoliciesInfo {
 			if pol.meta.hash == policy.meta.hash && policy.policyType.CheckFor(NETWORK_POLICY_EGRESS) {
-				podsProtocols.Merge(&policy.targetPods.podsProtocols)
 				comment := "run through nw policy " + policy.meta.name + " " + policyRuleEgress{}.String()
 				policyChainName := kubeNetworkPolicyChainPrefix.Get(policy.meta.namespace, policy.meta.name, policyRuleEgress{}.String())
+				if !activeChains.Contains(policyChainName) {
+					continue
+				}
+				podsProtocols.Merge(&policy.targetPods.podsProtocols)
 				args = []string{"-m", "comment", "--comment", comment, "-j", policyChainName}
 				podOwnChain[podFwChainName].Add(netutils.NewRule(args...))
 			}
