@@ -4,8 +4,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/cloudnativelabs/kube-router/pkg/utils"
-	"github.com/cloudnativelabs/kube-router/pkg/utils/net-tools"
+	"github.com/cloudnativelabs/kube-router/pkg/helpers/api"
+	"github.com/cloudnativelabs/kube-router/pkg/helpers/hostnet"
 	"github.com/osrg/gobgp/config"
 	"github.com/osrg/gobgp/table"
 	v1core "k8s.io/api/core/v1"
@@ -32,7 +32,7 @@ func (nrc *NetworkRoutingController) addExportPolicies() error {
 		return nil
 	}
 
-	cidr, err := utils.GetPodCidrFromNodeSpec(nrc.clientset, nrc.hostnameOverride)
+	cidr, err := api.GetPodCidrFromNodeSpec(nrc.GetConfig().ClientSet, nrc.GetConfig().HostnameOverride)
 	if err != nil {
 		return err
 	}
@@ -55,7 +55,7 @@ func (nrc *NetworkRoutingController) addExportPolicies() error {
 	advIpPrefixList := make([]config.Prefix, 0)
 	advIps, _, _ := nrc.getAllVIPs()
 	for _, ip := range advIps {
-		advIpPrefixList = append(advIpPrefixList, config.Prefix{IpPrefix: netutils.NewIP(ip).ToCIDR()})
+		advIpPrefixList = append(advIpPrefixList, config.Prefix{IpPrefix: hostnet.NewIP(ip).ToCIDR()})
 	}
 	clusterIpPrefixSet, err := table.NewPrefixSet(config.PrefixSet{
 		PrefixSetName: "clusteripprefixset",
@@ -78,14 +78,14 @@ func (nrc *NetworkRoutingController) addExportPolicies() error {
 		}
 	}
 
-	if nrc.bgpEnableInternal {
+	if nrc.GetConfig().EnableiBGP {
 		// Get the current list of the nodes from the local cache
 		nodes := nrc.nodeLister.List()
 		iBGPPeers := make([]string, 0)
 		for _, node := range nodes {
 			nodeObj := node.(*v1core.Node)
-			nodeIP, err := utils.GetNodeIP(nodeObj)
-			if err != nil {
+			nodeIP := api.GetNodeIP(nodeObj)
+			if nodeIP == nil {
 				return fmt.Errorf("Failed to find a node IP: %s", err)
 			}
 			iBGPPeers = append(iBGPPeers, nodeIP.String())
@@ -101,7 +101,7 @@ func (nrc *NetworkRoutingController) addExportPolicies() error {
 		actions := config.Actions{
 			RouteDisposition: config.ROUTE_DISPOSITION_ACCEPT_ROUTE,
 		}
-		if nrc.overrideNextHop {
+		if nrc.GetConfig().OverrideNextHop {
 			actions.BgpActions.SetNextHop = "self"
 		}
 		// statement to represent the export policy to permit advertising node's pod CIDR
@@ -139,7 +139,7 @@ func (nrc *NetworkRoutingController) addExportPolicies() error {
 		if err != nil {
 			nrc.bgpServer.AddDefinedSet(ns)
 		}
-		if nrc.overrideNextHop {
+		if nrc.GetConfig().OverrideNextHop {
 			bgpActions.SetNextHop = "self"
 		}
 		// statement to represent the export policy to permit advertising cluster IP's
@@ -158,11 +158,11 @@ func (nrc *NetworkRoutingController) addExportPolicies() error {
 				BgpActions:       bgpActions,
 			},
 		})
-		if nrc.advertisePodCidr {
+		if nrc.GetConfig().AdvertiseNodePodCidr {
 			actions := config.Actions{
 				RouteDisposition: config.ROUTE_DISPOSITION_ACCEPT_ROUTE,
 			}
-			if nrc.overrideNextHop {
+			if nrc.GetConfig().OverrideNextHop {
 				actions.BgpActions.SetNextHop = "self"
 			}
 			statements = append(statements, config.Statement{

@@ -10,6 +10,7 @@ import (
 
 	"github.com/cloudnativelabs/kube-router/pkg/cmd"
 	"github.com/cloudnativelabs/kube-router/pkg/options"
+	"github.com/golang/glog"
 	"github.com/spf13/pflag"
 )
 
@@ -60,7 +61,7 @@ func Main() error {
 
 	if config.EnablePprof {
 		go func() {
-			fmt.Fprintf(os.Stdout, http.ListenAndServe("0.0.0.0:6060", nil).Error())
+			fmt.Fprintf(os.Stdout, http.ListenAndServe("[::]:6060", nil).Error())
 		}()
 	}
 
@@ -69,5 +70,7 @@ func Main() error {
 		return fmt.Errorf("Failed to run kube-router: %v", err)
 	}
 
+	glog.Flush()
+	glog.Infof("kube-router was stopped")
 	return nil
 }

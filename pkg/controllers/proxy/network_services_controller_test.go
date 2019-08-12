@@ -66,7 +66,7 @@ func (lnm *LinuxNetworkingMockImpl) ipvsDelService(ks *KubeService) error {
 	}
 	return nil
 }
-func (lnm *LinuxNetworkingMockImpl) ipvsGetDestinations(ipvsSvc *libipvs.Service, force ...bool) ipvsDestinationArrayType {
+func (lnm *LinuxNetworkingMockImpl) ipvsGetDestinations(ipvsSvc *libipvs.Service, force bool) ipvsDestinationArrayType {
 	return make(ipvsDestinationArrayType, 0)
 }
 func (lnm *LinuxNetworkingMockImpl) cleanupMangleTableRule(ip string, protocol string, port string, fwmark string) error {
@@ -150,7 +150,7 @@ var _ = Describe("NetworkServicesController", func() {
 		waitForListerWithTimeoutG(nsc.svcLister, time.Second*10)
 		waitForListerWithTimeoutG(nsc.epLister, time.Second*10)
 
-		nsc.buildServicesInfo(&nsc.serviceMap)
+		nsc.buildServicesInfo(nsc.serviceMap)
 	})
 	Context("service no endpoints with ExternalIPs", func() {
 		var fooSvc1, fooSvc2 *libipvs.Service

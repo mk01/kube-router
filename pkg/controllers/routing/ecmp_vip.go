@@ -6,8 +6,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/cloudnativelabs/kube-router/pkg/utils"
-	"github.com/cloudnativelabs/kube-router/pkg/utils/net-tools"
+	"github.com/cloudnativelabs/kube-router/pkg/helpers/hostnet"
 	"github.com/golang/glog"
 	"github.com/osrg/gobgp/table"
 	types "k8s.io/api/core/v1"
@@ -18,10 +17,10 @@ import (
 
 // bgpAdvertiseVIP advertises the service vip (cluster ip or load balancer ip or external IP) the configured peers
 func (nrc *NetworkRoutingController) bgpAdvertiseVIP(vip string) error {
-	ip := netutils.NewIP(vip)
-	node := netutils.NewIP(nrc.nodeIP)
+	ip := hostnet.NewIP(vip)
+	node := hostnet.NewIP(nrc.GetNodeIP())
 
-	glog.V(2).Infof("Advertising route: '%s via %s' to peers", ip.ToCIDR(), node.ToString())
+	glog.V(2).Infof("Advertising route: '%s via %s' to peers", ip.ToCIDR(), node.ToIP().String())
 	_, err := nrc.bgpServer.AddPath("", []*table.Path{table.NewPath(nil, ip.ToBgpPrefix(), false, getPathAttributes(ip, node), time.Now(), false)})
 
 	return err
@@ -29,10 +28,10 @@ func (nrc *NetworkRoutingController) bgpAdvertiseVIP(vip string) error {
 
 // bgpWithdrawVIP  unadvertises the service vip
 func (nrc *NetworkRoutingController) bgpWithdrawVIP(vip string) error {
-	ip := netutils.NewIP(vip)
-	node := netutils.NewIP(nrc.nodeIP)
+	ip := hostnet.NewIP(vip)
+	node := hostnet.NewIP(nrc.GetNodeIP())
 
-	glog.V(2).Infof("Withdrawing route: '%s via %s' to peers", ip.ToCIDR(), node.ToString())
+	glog.V(2).Infof("Withdrawing route: '%s via %s' to peers", ip.ToCIDR(), node.ToIP().String())
 	err := nrc.bgpServer.DeletePath([]byte(nil), 0, "", []*table.Path{table.NewPath(nil, ip.ToBgpPrefix(), true, getPathAttributes(ip, node), time.Now(), false)})
 
 	return err
@@ -78,9 +77,6 @@ func getServiceObject(obj interface{}) (svc *v1core.Service) {
 }
 
 func (nrc *NetworkRoutingController) handleServiceUpdate(svc *v1core.Service) {
-	utils.CommonLock.Lock()
-	defer utils.CommonLock.Unlock()
-
 	if !nrc.bgpServerStarted {
 		glog.V(3).Infof("Skipping update to service: %s/%s, controller still performing bootup full-sync", svc.Namespace, svc.Name)
 		return
@@ -320,20 +316,20 @@ func (nrc *NetworkRoutingController) getVIPsForService(svc *v1core.Service, only
 		}
 	}
 
-	if nrc.shouldAdvertiseService(svc, svcAdvertiseClusterAnnotation, nrc.advertiseClusterIP) {
+	if nrc.shouldAdvertiseService(svc, svcAdvertiseClusterAnnotation, nrc.GetConfig().AdvertiseClusterIp) {
 		clusterIp := nrc.getClusterIp(svc)
 		if clusterIp != "" {
 			ipList = append(ipList, clusterIp)
 		}
 	}
 
-	if nrc.shouldAdvertiseService(svc, svcAdvertiseExternalAnnotation, nrc.advertiseExternalIP) {
+	if nrc.shouldAdvertiseService(svc, svcAdvertiseExternalAnnotation, nrc.GetConfig().AdvertiseExternalIp) {
 		ipList = append(ipList, nrc.getExternalIps(svc)...)
 	}
 
 	// Deprecated: Use service.advertise.loadbalancer=false instead of service.skiplbips.
 	_, skiplbips := svc.Annotations[svcSkipLbIpsAnnotation]
-	advertiseLoadBalancer := nrc.shouldAdvertiseService(svc, svcAdvertiseLoadBalancerAnnotation, nrc.advertiseLoadBalancerIP)
+	advertiseLoadBalancer := nrc.shouldAdvertiseService(svc, svcAdvertiseLoadBalancerAnnotation, nrc.GetConfig().AdvertiseLoadBalancerIp)
 	if advertiseLoadBalancer && !skiplbips {
 		ipList = append(ipList, nrc.getLoadBalancerIps(svc)...)
 	}
@@ -375,7 +371,7 @@ func (nrc *NetworkRoutingController) nodeHasEndpointsForService(svc *v1core.Serv
 
 	for _, subset := range ep.Subsets {
 		for _, address := range subset.Addresses {
-			if *address.NodeName == nrc.nodeName {
+			if *address.NodeName == nrc.GetNodeName() {
 				return true, nil
 			}
 		}

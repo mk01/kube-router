@@ -5,17 +5,22 @@ import (
 	"fmt"
 	"net"
 	"strconv"
-	"strings"
 	"time"
 
+	"os"
+	"syscall"
+
+	"github.com/cloudnativelabs/kube-router/pkg/helpers/api"
+	"github.com/cloudnativelabs/kube-router/pkg/helpers/hostnet"
+	"github.com/cloudnativelabs/kube-router/pkg/helpers/tools"
 	"github.com/cloudnativelabs/kube-router/pkg/metrics"
 	"github.com/cloudnativelabs/kube-router/pkg/options"
-	"github.com/cloudnativelabs/kube-router/pkg/utils"
 	"github.com/golang/glog"
+	"github.com/google/go-cmp/cmp"
 	"github.com/osrg/gobgp/config"
+	"github.com/osrg/gobgp/packet/bgp"
 	gobgp "github.com/osrg/gobgp/server"
 	v1core "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/cache"
 )
 
@@ -36,60 +41,46 @@ func (nrc *NetworkRoutingController) syncInternalPeers() {
 		glog.V(2).Infof("Syncing BGP peers for the node took %v", endTime)
 	}()
 
-	// get the current list of the nodes from API server
-	nodes, err := nrc.clientset.CoreV1().Nodes().List(metav1.ListOptions{})
-	if err != nil {
-		glog.Errorf("Failed to list nodes from API server due to: %s. Cannot perform BGP peer sync", err.Error())
-		return
-	}
+	nodes := api.GetAllClusterNodes(nrc.nodeLister)
 	if nrc.MetricsEnabled {
-		metrics.ControllerBPGpeers.Set(float64(len(nodes.Items)))
+		metrics.ControllerBPGpeers.Set(float64(len(nodes)))
 	}
+
+	removedNodes := make(map[string]bool)
+	nrc.activeNodes.Range(func(node, present interface{}) bool {
+		removedNodes[node.(string)] = true
+		return true
+	})
+
 	// establish peer and add Pod CIDRs with current set of nodes
-	currentNodes := make([]string, 0)
-	for _, node := range nodes.Items {
-		nodeIP, _ := utils.GetNodeIP(&node)
+	for _, node := range nodes {
+		nodeIP := api.GetNodeIP(node)
+		delete(removedNodes, nodeIP.String())
 
 		// skip self
-		if nodeIP.String() == nrc.nodeIP.String() {
+		// or send signal to quit (and restart) if the node changed IP
+		if nodeIP.Equal(nrc.GetConfig().GetNodeIP().IP) {
 			continue
+		} else if node.Name == nrc.GetNodeName() {
+			glog.Errorf("Node changed it's IP address (%s -> %s), signalling parent to restart", nrc.GetNodeIP(), nodeIP)
+			process, _ := os.FindProcess(nrc.GetConfig().KubeRouterPid)
+			process.Signal(syscall.SIGINT)
+			return
 		}
 
 		// we are rr-client peer only with rr-server
-		if nrc.bgpRRClient {
-			if _, ok := node.ObjectMeta.Annotations[rrServerAnnotation]; !ok {
-				continue
-			}
+		if _, ok := node.ObjectMeta.Annotations[rrServerAnnotation]; !ok && nrc.bgpRRClient {
+			continue
 		}
 
 		// if node full mesh is not requested then just peer with nodes with same ASN
 		// (run iBGP among same ASN peers)
-		if !nrc.bgpFullMeshMode {
-			nodeasn, ok := node.ObjectMeta.Annotations[nodeASNAnnotation]
-			if !ok {
-				glog.Infof("Not peering with the Node %s as ASN number of the node is unknown.",
-					nodeIP.String())
-				continue
-			}
-
-			asnNo, err := strconv.ParseUint(nodeasn, 0, 32)
-			if err != nil {
-				glog.Infof("Not peering with the Node %s as ASN number of the node is invalid.",
-					nodeIP.String())
-				continue
-			}
-
-			// if the nodes ASN number is different from ASN number of current node skip peering
-			if nrc.nodeAsnNumber != uint32(asnNo) {
-				glog.Infof("Not peering with the Node %s as ASN number of the node is different.",
-					nodeIP.String())
-				continue
-			}
+		if info := nrc.getCheckNodeAsn(node, nodeIP.String()); info != nil {
+			glog.Info(info.Error())
+			continue
 		}
 
-		currentNodes = append(currentNodes, nodeIP.String())
-		nrc.activeNodes[nodeIP.String()] = true
-		n := &config.Neighbor{
+		neighborConfig := &config.Neighbor{
 			Config: config.NeighborConfig{
 				NeighborAddress: nodeIP.String(),
 				PeerAs:          nrc.nodeAsnNumber,
@@ -101,23 +92,14 @@ func (nrc *NetworkRoutingController) syncInternalPeers() {
 			},
 		}
 
-		if nrc.bgpGracefulRestart {
-			n.GracefulRestart = config.GracefulRestart{
-				Config: config.GracefulRestartConfig{
-					Enabled: true,
-				},
-				State: config.GracefulRestartState{
-					LocalRestarting: true,
-				},
-			}
-		}
+		injectGrRestart(nrc.GetConfig(), neighborConfig, true)
+		injectAsiSafiConfigs(nodeIP, nrc.GetConfig(), &neighborConfig.AfiSafis)
 
-		injectAsiSafiConfigs(nodeIP, true, n.AfiSafis)
 		// we are rr-server peer with other rr-client with reflection enabled
 		if nrc.bgpRRServer {
 			if _, ok := node.ObjectMeta.Annotations[rrClientAnnotation]; ok {
 				//add rr options with clusterId
-				n.RouteReflector = config.RouteReflector{
+				neighborConfig.RouteReflector = config.RouteReflector{
 					Config: config.RouteReflectorConfig{
 						RouteReflectorClient:    true,
 						RouteReflectorClusterId: config.RrClusterIdType(fmt.Sprint(nrc.bgpClusterID)),
@@ -130,31 +112,29 @@ func (nrc *NetworkRoutingController) syncInternalPeers() {
 			}
 		}
 
-		// TODO: check if a node is alredy added as nieighbour in a better way than add and catch error
-		if err := nrc.bgpServer.AddNeighbor(n); err != nil {
-			if !strings.Contains(err.Error(), "Can't overwrite the existing peer") {
-				glog.Errorf("Failed to add node %s as peer due to %s", nodeIP.String(), err)
-			}
+		prevNeighConfig, active := nrc.activeNodes.Load(nodeIP.String())
+		if active && cmp.Equal(prevNeighConfig.(config.Neighbor), *neighborConfig, cmpExclude) {
+			continue
 		}
-	}
 
-	// find the list of the node removed, from the last known list of active nodes
-	removedNodes := make([]string, 0)
-	for ip := range nrc.activeNodes {
-		stillActive := false
-		for _, node := range currentNodes {
-			if ip == node {
-				stillActive = true
-				break
-			}
+		copyNeighborConfig := *neighborConfig
+		reset, err := bgpFunc[active](nrc.bgpServer, neighborConfig)
+		if err != nil {
+			glog.Errorf("Failed to add/update node %s as peer due to %s", nodeIP.String(), err)
+			continue
 		}
-		if !stillActive {
-			removedNodes = append(removedNodes, ip)
+		nrc.activeNodes.Store(nodeIP.String(), copyNeighborConfig)
+		if !reset {
+			continue
+		}
+
+		for _, afisafi := range getAfiSafiTypes(nodeIP) {
+			tools.Eval(nrc.bgpServer.SoftResetIn("", bgp.AddressFamilyValueMap[string(afisafi)]))
 		}
 	}
 
 	// delete the neighbor for the nodes that are removed
-	for _, ip := range removedNodes {
+	for ip := range removedNodes {
 		n := &config.Neighbor{
 			Config: config.NeighborConfig{
 				NeighborAddress: ip,
@@ -164,26 +144,39 @@ func (nrc *NetworkRoutingController) syncInternalPeers() {
 		if err := nrc.bgpServer.DeleteNeighbor(n); err != nil {
 			glog.Errorf("Failed to remove node %s as peer due to %s", ip, err)
 		}
-		delete(nrc.activeNodes, ip)
+
+		nrc.removeRoutesForNode(hostnet.NewIP(ip).ToIP())
+		nrc.activeNodes.Delete(ip)
 	}
+}
+
+func (nrc *NetworkRoutingController) getCheckNodeAsn(node *v1core.Node, nodeIP string) (ok error) {
+	if nrc.GetConfig().FullMeshMode {
+		return
+	}
+
+	if nodeasn, e := node.ObjectMeta.Annotations[nodeASNAnnotation]; !e {
+		ok = tools.NewErrorf("Not peering with the Node %s as ASN number of the node is unknown.", nodeIP)
+
+	} else if asnNo, e := strconv.ParseUint(nodeasn, 0, 32); e != nil {
+		ok = tools.NewErrorf("Not peering with the Node %s as ASN number of the node is invalid.", nodeIP)
+
+		// if the nodes ASN number is different from ASN number of current node skip peering
+	} else if nrc.nodeAsnNumber != uint32(asnNo) {
+		ok = tools.NewErrorf("Not peering with the Node %s as ASN number of the node is different.", nodeIP)
+
+	}
+
+	return
 }
 
 // connectToExternalBGPPeers adds all the configured eBGP peers (global or node specific) as neighbours
 func connectToExternalBGPPeers(server *gobgp.BgpServer, peerNeighbors []*config.Neighbor, bgpGracefulRestart bool, peerMultihopTtl uint8) error {
 	for _, n := range peerNeighbors {
 
-		if bgpGracefulRestart {
-			n.GracefulRestart = config.GracefulRestart{
-				Config: config.GracefulRestartConfig{
-					Enabled: true,
-				},
-				State: config.GracefulRestartState{
-					LocalRestarting: true,
-				},
-			}
-		}
+		injectGrRestart(krConfig, n, false)
+		injectAsiSafiConfigs(net.ParseIP(n.Config.NeighborAddress), krConfig, &n.AfiSafis)
 
-		injectAsiSafiConfigs(net.ParseIP(n.Config.NeighborAddress), bgpGracefulRestart, n.AfiSafis)
 		if peerMultihopTtl > 1 {
 			n.EbgpMultihop = config.EbgpMultihop{
 				Config: config.EbgpMultihopConfig{
@@ -274,22 +267,21 @@ func (nrc *NetworkRoutingController) newNodeEventHandler() cache.ResourceEventHa
 	return cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			node := obj.(*v1core.Node)
-			nodeIP, _ := utils.GetNodeIP(node)
+			nodeIP := api.GetNodeIP(node)
 
 			glog.V(2).Infof("Received node %s added update from watch API so peer with new node", nodeIP)
-			nrc.OnNodeUpdate(obj)
+			nrc.OnNodeUpdate(node)
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			// we are interested only node add/delete, so skip update
-			return
-
+			nrc.OnNodeUpdate(oldObj.(*v1core.Node))
 		},
 		DeleteFunc: func(obj interface{}) {
 			node := obj.(*v1core.Node)
-			nodeIP, _ := utils.GetNodeIP(node)
+			nodeIP := api.GetNodeIP(node)
 
 			glog.Infof("Received node %s removed update from watch API, so remove node from peer", nodeIP)
-			nrc.OnNodeUpdate(obj)
+			nrc.OnNodeUpdate(node)
 		},
 	}
 }
@@ -297,7 +289,7 @@ func (nrc *NetworkRoutingController) newNodeEventHandler() cache.ResourceEventHa
 // OnNodeUpdate Handle updates from Node watcher. Node watcher calls this method whenever there is
 // new node is added or old node is deleted. So peer up with new node and drop peering
 // from old node
-func (nrc *NetworkRoutingController) OnNodeUpdate(obj interface{}) {
+func (nrc *NetworkRoutingController) OnNodeUpdate(node *v1core.Node) {
 	if !nrc.bgpServerStarted {
 		return
 	}
@@ -308,13 +300,13 @@ func (nrc *NetworkRoutingController) OnNodeUpdate(obj interface{}) {
 		glog.Errorf("Error adding BGP export policies: %s", err.Error())
 	}
 
-	if nrc.bgpEnableInternal {
+	if nrc.GetConfig().EnableiBGP {
 		nrc.syncInternalPeers()
 	}
 
 	// skip if first round of disableSourceDestinationCheck() is not done yet, this is to prevent
 	// all the nodes for all the node add update trying to perfrom disableSourceDestinationCheck
 	if nrc.disableSrcDstCheck && nrc.initSrcDstCheckDone && nrc.ec2IamAuthorized {
-		nrc.disableSourceDestinationCheck()
+		nrc.disableSourceDestinationCheck([]*v1core.Node{node})
 	}
 }

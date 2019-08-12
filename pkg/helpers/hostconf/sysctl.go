@@ -1,7 +1,8 @@
-package utils
+package hostconf
 
 import (
 	"fmt"
+	"github.com/golang/glog"
 	"io/ioutil"
 	"os"
 	"strconv"
@@ -19,6 +20,8 @@ type SysCtlConfigRuleType struct {
 	Value int
 }
 
+type SysCtlConfigRuleListType []*SysCtlConfigRuleType
+
 // Error return the error as string
 func (e *SysctlError) Error() string {
 	return fmt.Sprintf("Sysctl %s=%d : %s", e.option, e.value, e.err)
@@ -29,8 +32,20 @@ func (e *SysctlError) IsFatal() bool {
 	return e.fatal
 }
 
-// SetSysctl sets a sysctl value
-func SetSysctl(c SysCtlConfigRuleType) *SysctlError {
+func (sctl *SysCtlConfigRuleListType) Apply() (err error) {
+	var errs []error
+	for i := range *sctl {
+		if err = (*sctl)[i].SetValue(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errs[len(errs)-1]
+}
+
+// SetValue sets a sysctl value
+func (c *SysCtlConfigRuleType) SetValue() *SysctlError {
+	glog.V(2).Infof("SysCtl: writing %d to %s", c.Value, c.Path)
+
 	sysctlPath := fmt.Sprintf("/proc/sys/%s", c.Path)
 	if _, err := os.Stat(sysctlPath); err != nil {
 		if os.IsNotExist(err) {
@@ -38,6 +53,7 @@ func SetSysctl(c SysCtlConfigRuleType) *SysctlError {
 		}
 		return &SysctlError{"stat error: " + err.Error(), c.Path, c.Value, true}
 	}
+
 	err := ioutil.WriteFile(sysctlPath, []byte(strconv.Itoa(c.Value)), 0640)
 	if err != nil {
 		return &SysctlError{"could not set due to: " + err.Error(), c.Path, c.Value, true}

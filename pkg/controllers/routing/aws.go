@@ -11,21 +11,16 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/golang/glog"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"k8s.io/api/core/v1"
 )
 
 // disableSourceDestinationCheck disables src-dst check of all the VM's when cluster
 // is provisioned on AWS. EC2 by default drops any packets originating or destination
 // to a VM with IP other than that of VM's ip. This check needs to be disabled so that
 // cross node pod-to-pod traffic can be sent and recived by a VM.
-func (nrc *NetworkRoutingController) disableSourceDestinationCheck() {
-	nodes, err := nrc.clientset.CoreV1().Nodes().List(metav1.ListOptions{})
-	if err != nil {
-		glog.Errorf("Failed to list nodes from API server due to: %s. Cannot perform BGP peer sync", err.Error())
-		return
-	}
-
-	for _, node := range nodes.Items {
+func (nrc *NetworkRoutingController) disableSourceDestinationCheck(allNodes []*v1.Node) {
+	for _, node := range allNodes {
 		if node.Spec.ProviderID == "" || !strings.HasPrefix(node.Spec.ProviderID, "aws") {
 			return
 		}
@@ -52,8 +47,8 @@ func (nrc *NetworkRoutingController) disableSourceDestinationCheck() {
 			},
 		)
 		if err != nil {
-			awserr := err.(awserr.Error)
-			if awserr.Code() == "UnauthorizedOperation" {
+			erraws := err.(awserr.Error)
+			if erraws.Code() == "UnauthorizedOperation" {
 				nrc.ec2IamAuthorized = false
 				glog.Errorf("Node does not have necessary IAM creds to modify instance attribute. So skipping disabling src-dst check.")
 				return

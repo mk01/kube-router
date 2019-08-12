@@ -18,11 +18,13 @@ import (
 	"github.com/cloudnativelabs/kube-router/pkg/options"
 	"github.com/golang/glog"
 
-	"github.com/cloudnativelabs/kube-router/pkg/utils/net-tools"
+	"github.com/cloudnativelabs/kube-router/pkg/helpers/async_worker"
+	"github.com/cloudnativelabs/kube-router/pkg/helpers/hostnet"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"net"
 	"time"
 )
 
@@ -32,7 +34,6 @@ var buildDate string
 
 // KubeRouter holds the information needed to run server
 type KubeRouter struct {
-	Client kubernetes.Interface
 	Config *options.KubeRouterConfig
 	hc     *healthcheck.HealthController
 }
@@ -61,12 +62,14 @@ func NewKubeRouterDefault(config *options.KubeRouterConfig) (*KubeRouter, error)
 		return nil, errors.New("Failed to create Kubernetes client: " + err.Error())
 	}
 
-	return &KubeRouter{Client: clientset, Config: config}, nil
+	config.ClientSet = clientset
+	config.NodeInfo.InitCommons(config)
+	return &KubeRouter{Config: config}, nil
 }
 
 // CleanupConfigAndExit performs Cleanup on all three controllers
 func CleanupConfigAndExit() {
-	ipm := netutils.NewIpTablesManager([]string{})
+	ipm := hostnet.NewIpTablesManager(net.IP{})
 
 	npc := netpol.NetworkPolicyController{Ipm: ipm}
 	npc.Cleanup()
@@ -76,14 +79,6 @@ func CleanupConfigAndExit() {
 
 	nrc := routing.NetworkRoutingController{Ipm: ipm}
 	nrc.Cleanup()
-}
-
-func (kr *KubeRouter) spawnController(healthCh chan *controllers.ControllerHeartbeat, stopCh <-chan struct{}, wg *sync.WaitGroup, cnt controllers.Controller) {
-	kr.hc.SetAlive(cnt)
-
-	if err := cnt.Run(healthCh, stopCh, wg); err != nil {
-		glog.Errorf("Can't start controller: %s", err.Error())
-	}
 }
 
 // Run starts the controllers and waits forever till we get SIGINT or SIGTERM
@@ -99,14 +94,12 @@ func (kr *KubeRouter) Run() error {
 		os.Exit(0)
 	}
 
-	kr.hc, err = healthcheck.NewHealthController(kr.Config)
-	if err != nil {
-		return errors.New("Failed to create health controller: " + err.Error())
-	}
-	wg.Add(1)
-	go kr.spawnController(healthChan, stopCh, &wg, kr.hc)
+	kr.Config.KubeRouterPid = os.Getpid()
 
-	informerFactory := informers.NewSharedInformerFactory(kr.Client, 0)
+	kr.hc = healthcheck.NewHealthController(healthChan, kr.Config)
+	go kr.hc.Run(stopCh, &wg, kr.hc)
+
+	informerFactory := informers.NewSharedInformerFactory(kr.Config.ClientSet, 0)
 	svcInformer := informerFactory.Core().V1().Services().Informer()
 	epInformer := informerFactory.Core().V1().Endpoints().Informer()
 	podInformer := informerFactory.Core().V1().Pods().Informer()
@@ -120,63 +113,22 @@ func (kr *KubeRouter) Run() error {
 		return errors.New("Failed to synchronize cache: " + err.Error())
 	}
 
-	if (kr.Config.MetricsPort > 0) && (kr.Config.MetricsPort <= 65535) {
+	if kr.Config.MetricsPort > 0 {
 		kr.Config.MetricsEnabled = true
-		mc, err := metrics.NewMetricsController(kr.Client, kr.Config)
-		if err != nil {
-			return errors.New("Failed to create metrics controller: " + err.Error())
-		}
-		wg.Add(1)
-		go kr.spawnController(healthChan, stopCh, &wg, mc)
-
-	} else if kr.Config.MetricsPort > 65535 {
-		glog.Errorf("Metrics port must be over 0 and under 65535, given port: %d", kr.Config.MetricsPort)
-		kr.Config.MetricsEnabled = false
-	} else {
-		kr.Config.MetricsEnabled = false
+		go metrics.NewMetricsController(kr.Config).Run(stopCh, &wg, kr.hc)
 	}
 
 	if kr.Config.RunFirewall {
-		npc, err := netpol.NewNetworkPolicyController(kr.Client,
-			kr.Config, podInformer, npInformer, nsInformer, epInformer, svcInformer)
-		if err != nil {
-			return errors.New("Failed to create network policy controller: " + err.Error())
-		}
-
-		podInformer.AddEventHandler(npc.PodEventHandler)
-		nsInformer.AddEventHandler(npc.NamespaceEventHandler)
-		npInformer.AddEventHandler(npc.NetworkPolicyEventHandler)
-
-		wg.Add(1)
-		go kr.spawnController(healthChan, stopCh, &wg, npc)
+		go netpol.NewNetworkPolicyController(kr.Config, podInformer, npInformer, nsInformer, epInformer, svcInformer, nodeInformer).
+			Run(stopCh, &wg, kr.hc)
 	}
 
 	if kr.Config.RunRouter {
-		nrc, err := routing.NewNetworkRoutingController(kr.Client, kr.Config, nodeInformer, svcInformer, epInformer)
-		if err != nil {
-			return errors.New("Failed to create network routing controller: " + err.Error())
-		}
-
-		nodeInformer.AddEventHandler(nrc.NodeEventHandler)
-		svcInformer.AddEventHandler(nrc.ServiceEventHandler)
-		epInformer.AddEventHandler(nrc.EndpointsEventHandler)
-
-		wg.Add(1)
-		go kr.spawnController(healthChan, stopCh, &wg, nrc)
+		go routing.NewNetworkRoutingController(kr.Config, nodeInformer, svcInformer, epInformer).Run(stopCh, &wg, kr.hc)
 	}
 
 	if kr.Config.RunServiceProxy {
-		nsc, err := proxy.NewNetworkServicesController(kr.Client, kr.Config,
-			svcInformer, epInformer, podInformer)
-		if err != nil {
-			return errors.New("Failed to create network services controller: " + err.Error())
-		}
-
-		svcInformer.AddEventHandler(nsc.ServiceEventHandler)
-		epInformer.AddEventHandler(nsc.EndpointsEventHandler)
-
-		wg.Add(1)
-		go kr.spawnController(healthChan, stopCh, &wg, nsc)
+		go proxy.NewNetworkServicesController(kr.Config, svcInformer, epInformer, podInformer, nodeInformer).Run(stopCh, &wg, kr.hc)
 	}
 
 	// Handle SIGINT and SIGTERM
@@ -188,6 +140,7 @@ func (kr *KubeRouter) Run() error {
 	close(stopCh)
 
 	wg.Wait()
+	async_worker.GlobalManager.StopWorkerManager()
 	return nil
 }
 

@@ -1,8 +1,8 @@
-package netutils
+package hostnet
 
 import (
 	"fmt"
-	"github.com/cloudnativelabs/kube-router/pkg/utils"
+	"github.com/cloudnativelabs/kube-router/pkg/helpers/tools"
 	"github.com/coreos/go-iptables/iptables"
 	"github.com/osrg/gobgp/config"
 	"github.com/osrg/gobgp/packet/bgp"
@@ -21,14 +21,28 @@ type IqIp struct {
 	error    error
 }
 
-func NewList(ips []string) (out []*net.IPNet) {
+func newList(ips []string, out interface{}) {
 	var iqIp *IqIp
 	for _, ip := range ips {
 		iqIp = NewIP(ip)
 		if iqIp.error == nil {
-			out = append(out, iqIp.ToIPNet())
+			switch out := out.(type) {
+			case *[]*net.IPNet:
+				*out = append(*out, iqIp.ToIPNet())
+			case *[]net.IP:
+				*out = append(*out, iqIp.ToIP())
+			}
 		}
 	}
+}
+
+func NewIPList(ips []string) (out []net.IP) {
+	newList(ips, &out)
+	return
+}
+
+func NewIPNetList(ips []string) (out []*net.IPNet) {
+	newList(ips, &out)
 	return
 }
 
@@ -95,9 +109,9 @@ func (xip *IqIp) ToBgpPrefix() bgp.AddrPrefixInterface {
 
 func (xip *IqIp) ToBgpRouteAttrs(toAdvertise ...interface{}) bgp.PathAttributeInterface {
 	if V4 == xip.protocol {
-		return bgp.NewPathAttributeNextHop(xip.ToString())
+		return bgp.NewPathAttributeNextHop(xip.ToIP().String())
 	}
-	return bgp.NewPathAttributeMpReachNLRI(xip.ToString(), xip.ToBgpPrefixArray(toAdvertise...))
+	return bgp.NewPathAttributeMpReachNLRI(xip.ToIP().String(), xip.ToBgpPrefixArray(toAdvertise...))
 }
 
 func (xip *IqIp) ToBgpPrefixArray(toAdvertise ...interface{}) []bgp.AddrPrefixInterface {
@@ -123,7 +137,7 @@ func (xip *IqIp) ToPolicyPrefix() *config.Prefix {
 }
 
 func (xip *IqIp) ToString() string {
-	return xip.addr.IP.String()
+	return xip.String()
 }
 
 func (xip *IqIp) String() string {
@@ -134,14 +148,6 @@ func (xip *IqIp) ToCIDR() string {
 	return xip.addr.String()
 }
 
-func (xip *IqIp) ToSubnet() string {
-	return xip.addr.IP.String()
-}
-
-func (xip *IqIp) ToNetmaskHex() string {
-	return xip.addr.Mask.String()
-}
-
 func (xip *IqIp) ToIpvsNetmask() uint32 {
 	if xip.protocol == V4 {
 		return 0xffffffff
@@ -150,16 +156,11 @@ func (xip *IqIp) ToIpvsNetmask() uint32 {
 	}
 }
 
-func (xip *IqIp) ToStringWithPort(port string) string {
+func (xip *IqIp) ToStringWithPort(port uint16) string {
 	if xip.protocol == V4 {
-		return xip.ToString() + ":" + port
+		return xip.ToIP().String() + ":" + fmt.Sprint(port)
 	}
-	return "[" + xip.ToString() + "]:" + port
-}
-
-func (xip *IqIp) ToPrefix() int {
-	prefix, _ := xip.addr.Mask.Size()
-	return prefix
+	return "[" + xip.ToIP().String() + "]:" + fmt.Sprint(port)
 }
 
 func (xip *IqIp) ToIP() net.IP {
@@ -182,7 +183,7 @@ func (xip *IqIp) ToError() error {
 	return xip.error
 }
 func (xip *IqIp) Family() uint16 {
-	if xip.protocol == V4 {
+	if xip.IsIPv4() {
 		return syscall.AF_INET
 	}
 	return syscall.AF_INET6
@@ -193,11 +194,14 @@ type IpCmdParams struct {
 	ReduceMTU                                int
 }
 
+// lets calculate with gre(6)tap although we use ip(6)tnl
+// reducemtu - ipv4 = tcp header (20) + eth header (8)
+// reducemtu - ipv6 = tcp header (40) + eth header (8)
 func (xip *IqIp) ProtocolCmdParam() *IpCmdParams {
 	if xip.protocol == V4 {
-		return &IpCmdParams{ReduceMTU: 20, Inet: "-4", Mode: "ipip", TunnelProto: "4", IptCmd: utils.GetPath("iptables"), IcmpStr: "icmp"}
+		return &IpCmdParams{ReduceMTU: 28, Inet: "-4", Mode: "ipip", TunnelProto: "4", IptCmd: tools.GetExecPath("iptables"), IcmpStr: "icmp"}
 	}
-	return &IpCmdParams{ReduceMTU: 40, Inet: "-6", Mode: "ip6ip6", TunnelProto: "41", IptCmd: utils.GetPath("ip6tables"), IcmpStr: "icmpv6"}
+	return &IpCmdParams{ReduceMTU: 48, Inet: "-6", Mode: "ip6ip6", TunnelProto: "41", IptCmd: tools.GetExecPath("ip6tables"), IcmpStr: "icmpv6"}
 }
 
 func (xip *IqIp) Contains(in interface{}) bool {
@@ -215,24 +219,27 @@ func (xip *IqIp) Contains(in interface{}) bool {
 }
 
 func (xip *IqIp) IsIPv4() bool {
-	return Isipv4(xip.addr.IP)
+	return xip.protocol == V4
 }
 
 func assignProtocol(xip *IqIp) {
-	if xip.IsIPv4() {
+	if Isipv4(xip.addr.IP) {
 		xip.protocol = V4
 	} else {
 		xip.protocol = V6
 	}
-	if xip.addr.Mask == nil {
-		if xip.IsIPv4() {
-			xip.addr.Mask = IP4Mask
-		} else {
-			xip.addr.Mask = IP6Mask
-		}
+	if xip.addr.Mask != nil {
+		return
+	}
+
+	switch xip.protocol {
+	case V4:
+		xip.addr.Mask = IP4Mask
+	case V6:
+		xip.addr.Mask = IP6Mask
 	}
 }
 
 func Isipv4(ip net.IP) bool {
-	return strings.Count(ip.String(), ":") < 2
+	return ip.To4() != nil
 }

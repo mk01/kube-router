@@ -1,4 +1,4 @@
-package utils
+package tools
 
 import (
 	"reflect"
@@ -6,20 +6,20 @@ import (
 
 	"github.com/golang/glog"
 	"github.com/google/go-cmp/cmp"
+	"golang.org/x/net/context"
 	"hash/fnv"
+	"k8s.io/apimachinery/pkg/apis/meta/v1"
 	"net"
+	"net/http"
 	"os/exec"
 	"strings"
 )
 
-var CommonLock *ChannelLockType
-
 type ApiTransaction struct {
-	Old interface{}
-	New interface{}
+	ObjMeta v1.Object
+	Old     interface{}
+	New     interface{}
 }
-
-type ChannelLockType chan int
 
 type Listener interface {
 	OnUpdate(instance interface{})
@@ -31,26 +31,18 @@ func (f ListenerFunc) OnUpdate(instance interface{}) {
 	f(instance)
 }
 
-type pathsToUtilsType map[string]string
+var pathsToUtils sync.Map
 
-var pathsToUtils pathsToUtilsType
-
-func init() {
-	var err error
-
-	CommonLock = NewChanLock(1)
-
-	pathsToUtils = make(map[string]string)
-	for _, util := range []string{"ip", "ip6tables", "iptables", "ipset"} {
-		pathsToUtils[util], err = exec.LookPath(util)
-		if err != nil {
-			glog.Error("Utils: can't get path to " + util + " err: " + err.Error())
-		}
+func GetExecPath(util string) string {
+	if path, _ := pathsToUtils.Load(util); path != nil {
+		return path.(string)
 	}
-}
-
-func GetPath(util string) string {
-	return pathsToUtils[util]
+	path, err := exec.LookPath(util)
+	if err != nil {
+		glog.Fatalf("Utils: can't get path to executable %s: %s ", util, err.Error())
+	}
+	pathsToUtils.Store(util, path)
+	return path
 }
 
 // reads only UP interfaces while completely excluding PtP and Loopback
@@ -86,17 +78,42 @@ func (b *Broadcaster) Notify(instance interface{}) {
 	}
 }
 
+type HttpStartStopWrapper struct {
+	*http.Server
+}
+
+func (hw *HttpStartStopWrapper) ServeAndLogReturn() {
+	if err := hw.ListenAndServe(); err != http.ErrServerClosed {
+		glog.Errorf("Health controller error: %s", err)
+	}
+}
+
+func (hw *HttpStartStopWrapper) ShutDown() (err error) {
+	return EvalPass(hw.Shutdown(context.Background()))
+}
+
+func CheckElementInArrayByFunction(element interface{}, array interface{}, fn func(a, b interface{}) bool) (ok bool) {
+	ok, _ = findElementInArray(element, array, fn)
+	return ok
+}
+
 func CheckForElementInArray(element interface{}, array interface{}, options ...cmp.Option) (ok bool) {
 	ok, _ = FindElementInArray(element, array, options...)
 	return
 }
 
 func FindElementInArray(element interface{}, array interface{}, options ...cmp.Option) (ok bool, i int) {
+	return findElementInArray(element, array, func(a, b interface{}) bool {
+		return cmp.Equal(a, b, options...)
+	})
+}
+
+func findElementInArray(element interface{}, array interface{}, fn func(a, b interface{}) bool) (ok bool, i int) {
 	arrayAccess := reflect.Indirect(reflect.ValueOf(array))
 	switch arrayAccess.Kind() {
 	case reflect.Slice, reflect.Array:
 		for ; i < arrayAccess.Len(); i++ {
-			if ok := cmp.Equal(element, arrayAccess.Index(i).Interface(), options...); ok {
+			if ok := fn(element, arrayAccess.Index(i).Interface()); ok {
 				return ok, i
 			}
 		}
@@ -104,8 +121,8 @@ func FindElementInArray(element interface{}, array interface{}, options ...cmp.O
 	return
 }
 
-func SymetricHasPrefix(a string, b string) bool {
-	if len(a)*len(b) == 0 {
+func SymmetricHasPrefix(a string, b string) bool {
+	if len(a)&len(b) == 0 {
 		return false
 	}
 	if len(a) > len(b) {
@@ -114,51 +131,14 @@ func SymetricHasPrefix(a string, b string) bool {
 	return strings.HasPrefix(b, a)
 }
 
-func DoHash(input string) uint32 {
+func GetHash(input string) uint32 {
 	h := fnv.New32a()
 	h.Write([]byte(input))
 	return h.Sum32()
 }
 
-func DoHash64(input string) uint64 {
+func GetHash64(input string) uint64 {
 	h := fnv.New64()
 	h.Write([]byte(input))
 	return h.Sum64()
-}
-
-func (cl *ChannelLockType) Lock() {
-	(*cl) <- 1
-}
-
-func (cl *ChannelLockType) Unlock() {
-	<-(*cl)
-}
-
-func NewChanLock(arg ...int) *ChannelLockType {
-	capacity := 1
-	if len(arg) > 0 {
-		capacity = arg[0]
-	}
-	var ll = make(ChannelLockType, capacity)
-	return &ll
-}
-
-type ControllerSyncLockType struct {
-	*ChannelLockType
-}
-
-func (cl *ControllerSyncLockType) Lock() {
-	CommonLock.Lock()
-	cl.ChannelLockType.Lock()
-}
-
-func (cl *ControllerSyncLockType) Unlock() {
-	cl.ChannelLockType.Unlock()
-	CommonLock.Unlock()
-}
-
-func (cl ControllerSyncLockType) New() *ControllerSyncLockType {
-	clp := &cl
-	clp.ChannelLockType = NewChanLock(1)
-	return &cl
 }

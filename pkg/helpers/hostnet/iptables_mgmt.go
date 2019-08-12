@@ -1,14 +1,16 @@
-package netutils
+package hostnet
 
 import (
 	"fmt"
-	"github.com/cloudnativelabs/kube-router/pkg/utils"
+	"github.com/cloudnativelabs/kube-router/pkg/helpers/tools"
 	"github.com/coreos/go-iptables/iptables"
 	"github.com/golang/glog"
 	"github.com/google/go-cmp/cmp"
+	"net"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 const hashTag = "ipmHash:"
@@ -22,9 +24,15 @@ type IpTablesRuleType struct {
 	keepOrder bool
 }
 
+type ReferenceFromType struct {
+	In   string
+	Pos  int
+	Rule []string
+}
+
 type IpTablesRuleApplyListType struct {
 	rules       *IpTablesRuleListType
-	noApplyList *map[int]bool
+	noApplyList map[int]bool
 }
 
 type IpTablesRuleListType []*IpTablesRuleType
@@ -33,10 +41,11 @@ type PerProtocolRuleListType map[Proto]*IpTablesRuleListType
 
 type IpTableManipulationType int
 
+type IpTablesHandler map[Proto]*iptables.IPTables
+
 type IpTablesManager struct {
-	chainsToCleanUp  []string
-	localAddressList []string
-	ipTablesHandler  map[Proto]*iptables.IPTables
+	ipTablesHandler  IpTablesHandler
+	localNodeAddress net.IP
 }
 
 type IpTablesCleanupRuleType struct {
@@ -53,68 +62,54 @@ const (
 	IPTABLES_FULL_CHAIN_SYNC
 	IPTABLES_APPEND_UNIQUE
 	IPTABLES_FULL_CHAIN_SYNC_NO_ORDER
-)
 
-const (
 	CHAIN_KUBE_SNAT_TARGET    = "KUBE-ROUTER-SNAT"
 	CHAIN_KUBE_COMMON_FORWARD = "KUBE-ROUTER-FORWARD"
-)
 
-const (
 	V4 = Proto(iptables.ProtocolIPv4)
 	V6 = Proto(iptables.ProtocolIPv6)
 )
 
 var defaultTables = []string{"filter", "nat", "mangle"}
-var NoReferencedChains = make([]string, 0)
 var EmptyIpTablesRuleListType = &IpTablesRuleListType{}
 
 var UsedTcpProtocols = ProtocolMapType{V4: true, V6: true}
 
-var ipmLock *utils.ChannelLockType
+var ipmLock sync.Mutex
 
-func init() {
-	ipmLock = utils.NewChanLock(1)
-}
-
-func NewIpTablesManager(localAddressList []string, cleanupChainsOnStartup ...IpTablesCleanupRuleType) *IpTablesManager {
+func NewIpTablesManager(localAddress net.IP, cleanupChainsOnStartup ...IpTablesCleanupRuleType) *IpTablesManager {
 	var ipm IpTablesManager
 
-	ipm.localAddressList = localAddressList
+	ipm.ipTablesHandler = *createNewHandler()
 
-	ipm.ipTablesHandler = make(map[Proto]*iptables.IPTables)
-	for p := range UsedTcpProtocols {
-		if handler, err := iptables.NewWithProtocol(iptables.Protocol(p)); err != nil {
-			glog.Fatalf("Can't create iptables handler: %s", err)
-		} else {
-			ipm.ipTablesHandler[p] = handler
-		}
+	if !localAddress.Equal(net.IP{}) {
+		ipm.localNodeAddress = localAddress
 	}
 
-	for p := range UsedTcpProtocols {
-		if err := ipm.IptablesStartUp(p, IPTABLES_FULL_CHAIN_SYNC); err != nil {
-			glog.Errorf("Can't create SNAT target: %s", err)
-			return nil
-		}
-	}
 	for p, h := range ipm.ipTablesHandler {
 		for _, ch := range cleanupChainsOnStartup {
 			IptablesCleanRule(h, p, ch, true)
 		}
 	}
+
+	glog.V(3).Info("Finished initialising IpTables controller")
 	return &ipm
+}
+
+func createNewHandler() *IpTablesHandler {
+	var ipTablesHandler = make(IpTablesHandler)
+	for p := range UsedTcpProtocols {
+		if handler, err := iptables.NewWithProtocol(iptables.Protocol(p)); err != nil {
+			glog.Fatalf("Can't create iptables handler: %s", err)
+		} else {
+			ipTablesHandler[p] = handler
+		}
+	}
+	return &ipTablesHandler
 }
 
 func (ipm *IpTablesManager) GetHandler(proto Proto) *iptables.IPTables {
 	return ipm.ipTablesHandler[proto]
-}
-
-func (ipm *IpTablesManager) RecordChainForCleanUp(chains ...string) {
-	for _, chain := range chains {
-		if !utils.CheckForElementInArray(chain, ipm.chainsToCleanUp) {
-			ipm.chainsToCleanUp = append(ipm.chainsToCleanUp, chain)
-		}
-	}
 }
 
 func (ipm *IpTablesManager) applyRules(protocol Proto, table string, chain string, action IpTableManipulationType, rules *IpTablesRuleApplyListType) (err error) {
@@ -125,7 +120,7 @@ func (ipm *IpTablesManager) applyRules(protocol Proto, table string, chain strin
 			break
 		}
 
-		if rules.noApplyList != nil && (*rules.noApplyList)[i] {
+		if rules.noApplyList != nil && (rules.noApplyList)[i] {
 			if len(rule.Args) < 1 {
 				deleted++
 			}
@@ -146,13 +141,25 @@ func (ipm *IpTablesManager) applyRules(protocol Proto, table string, chain strin
 	return
 }
 
-func (ipm *IpTablesManager) CreateIpTablesRuleWithChain(protocol Proto, table string, chain string, action IpTableManipulationType, referenceIn []string, logError bool, rules *IpTablesRuleListType) (err error) {
+func (ipm *IpTablesManager) CreateRuleChain(protocol Proto, table string, chain string, action IpTableManipulationType, logError bool, rules *IpTablesRuleListType, referenceIn ...ReferenceFromType) (err error) {
 	ipmLock.Lock()
 	defer ipmLock.Unlock()
-	return ipm.createIpTablesRuleWithChain(protocol, table, chain, action, referenceIn, logError, rules)
+	return ipm.createIpTablesRuleWithChain(protocol, table, chain, action, logError, rules, referenceIn...)
 }
 
-func (ipm *IpTablesManager) createIpTablesRuleWithChain(protocol Proto, table string, chain string, action IpTableManipulationType, referenceIn []string, logError bool, rules *IpTablesRuleListType) (err error) {
+func (ipm *IpTablesManager) checkPosition(in string, protocol Proto, table string, rule ...string) int {
+	pos := 0
+	chainList, _ := ipm.ipTablesHandler[protocol].List(table, in)
+	for _, s := range chainList {
+		if strings.HasSuffix(strings.Trim(s, " "), "-j "+rule[len(rule)-1]) {
+			break
+		}
+		pos++
+	}
+	return pos
+}
+
+func (ipm *IpTablesManager) createIpTablesRuleWithChain(protocol Proto, table string, chain string, action IpTableManipulationType, logError bool, rules *IpTablesRuleListType, referenceIn ...ReferenceFromType) (err error) {
 	var applyList *IpTablesRuleApplyListType
 
 	chainList, _ := ipm.ipTablesHandler[protocol].List(table, chain)
@@ -164,17 +171,29 @@ func (ipm *IpTablesManager) createIpTablesRuleWithChain(protocol Proto, table st
 		err = ipm.ipTablesHandler[protocol].ClearChain(table, chain)
 	}
 
-	ipm.RecordChainForCleanUp(chain)
-
 	for _, ch := range referenceIn {
 		if err != nil {
 			glog.Errorf("can't insert reference record %s", err)
 			break
 		}
-		if exists, err := ipm.ipTablesHandler[protocol].Exists(table, ch, "-j", chain); err != nil || exists {
+		rule := ch.Rule
+		rule = append(rule, "-j", chain)
+		currentPos := -1
+		if exists, err := ipm.ipTablesHandler[protocol].Exists(table, ch.In, rule...); err != nil {
+			continue
+		} else if exists && ch.Pos > 0 {
+			if currentPos = ipm.checkPosition(ch.In, protocol, table, rule...); currentPos != ch.Pos {
+				ipm.ipTablesHandler[protocol].Delete(table, ch.In, rule...)
+			} else {
+				continue
+			}
+		} else if exists {
 			continue
 		}
-		err = ipm.ipTablesHandler[protocol].Insert(table, ch, 1, "-j", chain)
+		if ch.Pos == 0 {
+			ch.Pos = 1
+		}
+		err = ipm.ipTablesHandler[protocol].Insert(table, ch.In, ch.Pos, rule...)
 	}
 
 	if err != nil || rules == nil {
@@ -187,7 +206,7 @@ func (ipm *IpTablesManager) createIpTablesRuleWithChain(protocol Proto, table st
 		applyList = &IpTablesRuleApplyListType{rules: rules}
 	}
 
-	if rules == nil || len(*rules) == 0 {
+	if rules == nil || rules.Size() == 0 {
 		return
 	}
 
@@ -207,7 +226,7 @@ func (ipm *IpTablesManager) prepareListForActionObsolete(protocol Proto, table, 
 			hash = extractHash(rule.Args[len(rule.Args)-1][len(hashTag):])
 			secondRun = true
 		} else {
-			hash = utils.DoHash64(strings.Join(rule.Args, ""))
+			hash = tools.GetHash64(strings.Join(rule.Args, ""))
 		}
 
 		if _, ok := hashList[hash]; ok || len(rule.Args) < 1 {
@@ -249,31 +268,19 @@ func (ipm *IpTablesManager) prepareListForActionObsolete(protocol Proto, table, 
 		}
 		deleted++
 	}
-	return &IpTablesRuleApplyListType{rules: rules, noApplyList: &noApplyList}
+	return &IpTablesRuleApplyListType{rules: rules, noApplyList: noApplyList}
 }
 
-func (ipm *IpTablesManager) IptablesStartUp(protocol Proto, action IpTableManipulationType) (err error) {
-	var rule *IpTablesRuleListType
-	if len(ipm.localAddressList) > 0 && protocol == NewIP(ipm.localAddressList[0]).Protocol() {
-		rule = &IpTablesRuleListType{&IpTablesRuleType{[]string{"-j", "SNAT", "--to", ipm.localAddressList[0]}, false}}
+func (ipm *IpTablesManager) IptablesCleanUp(chains ...string) {
+	for _, chain := range append(chains, CHAIN_KUBE_SNAT_TARGET) {
+		UsedTcpProtocols.ForEach(func(proto Proto) error {
+			return ipm.iptablesCleanUp(chain, proto)
+		})
 	}
-	err = ipm.CreateIpTablesRuleWithChain(protocol, "nat", CHAIN_KUBE_SNAT_TARGET, action, NoReferencedChains, true, rule)
-	if err == nil {
-		err = ipm.CreateIpTablesRuleWithChain(protocol, "filter", CHAIN_KUBE_COMMON_FORWARD, IPTABLES_APPEND_UNIQUE, []string{"FORWARD"}, true, EmptyIpTablesRuleListType)
-	}
-	return
 }
 
-func (ipm *IpTablesManager) IptablesCleanUp(chains ...string) error {
-	ipm.RecordChainForCleanUp(chains...)
-	return UsedTcpProtocols.ForEach(ipm.iptablesCleanUp)
-}
-
-func (ipm *IpTablesManager) iptablesCleanUp(protocol Proto) error {
-	for _, chain := range append(ipm.chainsToCleanUp, CHAIN_KUBE_SNAT_TARGET) {
-		ipm.iptablesCleanUpChain(protocol, chain, true, ComparerStd)
-	}
-	return nil
+func (ipm *IpTablesManager) iptablesCleanUp(chain string, protocol Proto) error {
+	return ipm.iptablesCleanUpChain(protocol, chain, true, ComparerStd)
 }
 
 func (ipm *IpTablesManager) IptablesCleanUpChainWithComparer(protocol Proto, chain string, shouldLog bool, option cmp.Option, tables ...string) error {
@@ -293,11 +300,11 @@ func (ipm *IpTablesManager) iptablesCleanUpChain(protocol Proto, chain string, s
 	}
 	for _, table := range tables {
 		chainList, _ := ipm.ipTablesHandler[protocol].ListChains(table)
-		if !utils.CheckForElementInArray(chain, chainList, option) {
+		if !tools.CheckForElementInArray(chain, chainList, option) {
 			continue
 		}
 
-		toDelete := make([]string, 0)
+		toDelete := make([]string, 0, len(chainList))
 		for _, referencingChain := range chainList {
 			if cmp.Equal(referencingChain, chain, option) {
 				ipm.ipTablesHandler[protocol].ClearChain(table, referencingChain)
@@ -313,7 +320,7 @@ func (ipm *IpTablesManager) iptablesCleanUpChain(protocol Proto, chain string, s
 
 		for _, rmChain := range toDelete {
 			if ipm.ipTablesHandler[protocol].DeleteChain(table, rmChain) == nil && shouldLog {
-				glog.Infof("Deleted %s chain %s from table %s.", NewIP(protocol).ProtocolCmdParam().IptCmd, rmChain, table)
+				glog.V(1).Infof("Deleted %s chain %s from table %s.", NewIP(protocol).ProtocolCmdParam().IptCmd, rmChain, table)
 			}
 		}
 	}
@@ -321,6 +328,8 @@ func (ipm *IpTablesManager) iptablesCleanUpChain(protocol Proto, chain string, s
 }
 
 func IptablesCleanRule(handler *iptables.IPTables, protocol Proto, toDelete IpTablesCleanupRuleType, shouldLog bool) error {
+	ipmLock.Lock()
+	defer ipmLock.Unlock()
 	for _, table := range defaultTables {
 		chainList, _ := handler.ListChains(table)
 		for _, referencingChain := range chainList {
@@ -342,7 +351,7 @@ func deleteMatchingRules(handler *iptables.IPTables, protocol Proto, table strin
 		args := strings.Fields(rule)
 		if args[0] == "-A" {
 			order++
-			if utils.CheckForElementInArray(toDelete, args) {
+			if tools.CheckForElementInArray(toDelete, args) {
 				if err := handler.Delete(table, chain, fmt.Sprint(order)); err == nil && shouldLog {
 					glog.Infof("Deleted %s rule %s from table %s", NewIP(protocol).ProtocolCmdParam().IptCmd, args[2:], table)
 					order--
@@ -354,8 +363,8 @@ func deleteMatchingRules(handler *iptables.IPTables, protocol Proto, table strin
 	}
 }
 
-func NewPerProtoRuleList() *PerProtocolRuleListType {
-	return &PerProtocolRuleListType{V4: &IpTablesRuleListType{}, V6: &IpTablesRuleListType{}}
+func NewPerProtoRuleList() PerProtocolRuleListType {
+	return PerProtocolRuleListType{V4: &IpTablesRuleListType{}, V6: &IpTablesRuleListType{}}
 }
 
 func (rl *IpTablesRuleListType) Add(rule ...*IpTablesRuleType) {
@@ -373,19 +382,26 @@ func (rl *IpTablesRuleListType) String() (out string) {
 	return
 }
 
-func (pl *ProtocolMapType) Merge(apply *ProtocolMapType) {
+func (pl *ProtocolMapType) Merge(apply *ProtocolMapType) *ProtocolMapType {
 	for proto := range *apply {
 		(*pl)[proto] = true
 	}
+	return pl
 }
 
-func (pl ProtocolMapType) ForEach(fn func(Proto) error) error {
+func (pl ProtocolMapType) Copy() *ProtocolMapType {
+	newMap := ProtocolMapType{}
 	for proto := range pl {
-		if err := fn(proto); err != nil {
-			return err
-		}
+		newMap[proto] = true
 	}
-	return nil
+	return &newMap
+}
+
+func (pl ProtocolMapType) ForEach(fn func(Proto) error) (e error) {
+	for proto := range pl {
+		tools.UpdateErrorf(&e, fn(proto))
+	}
+	return
 }
 
 func (pl ProtocolMapType) ForEachWithLock(fn func(Proto) error) error {
@@ -395,7 +411,7 @@ func (pl ProtocolMapType) ForEachWithLock(fn func(Proto) error) error {
 }
 
 func (pl ProtocolMapType) ForEachCreateRulesWithChain(ipm *IpTablesManager, table string, chain string, action IpTableManipulationType,
-	referenceIn []string, logError bool, rules interface{}) (err error, processedRules int) {
+	logError bool, rules interface{}, referenceIn ...ReferenceFromType) (err error, processedRules int) {
 
 	ipmLock.Lock()
 	defer ipmLock.Unlock()
@@ -405,14 +421,16 @@ func (pl ProtocolMapType) ForEachCreateRulesWithChain(ipm *IpTablesManager, tabl
 		switch tRules := rules.(type) {
 		case *IpTablesRuleListType:
 			rulesToApply = ChainToRuleListMapType{chain: tRules}
-		case *PerProtocolRuleListType:
-			rulesToApply = ChainToRuleListMapType{chain: (*tRules)[proto]}
+		case PerProtocolRuleListType:
+			rulesToApply = ChainToRuleListMapType{chain: tRules[proto]}
 		case ChainToRuleListMapType:
 			rulesToApply = tRules
+		default:
+			glog.Error("Unknown type to process (%V)", rules)
 		}
 
 		for chainName := range rulesToApply {
-			if err = ipm.createIpTablesRuleWithChain(proto, table, chainName, action, referenceIn, logError, rulesToApply[chainName]); err != nil {
+			if err = ipm.createIpTablesRuleWithChain(proto, table, chainName, action, logError, rulesToApply[chainName], referenceIn...); err != nil {
 				return
 			}
 			processedRules += len(*rulesToApply[chainName])

@@ -1,16 +1,18 @@
-package netutils
+package hostnet
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"net"
 	"os/exec"
-	"strings"
 
-	"github.com/cloudnativelabs/kube-router/pkg/utils"
 	"github.com/coreos/go-iptables/iptables"
 	"github.com/golang/glog"
+	"sync"
+
+	"github.com/cloudnativelabs/kube-router/pkg/helpers/async_worker"
+	"github.com/cloudnativelabs/kube-router/pkg/helpers/tools"
+	"strings"
 )
 
 const (
@@ -46,6 +48,8 @@ const (
 	TypeHashIPNetPortNet = "hash:net,port,net"
 	// TypeHashNetIface The hash:net,iface set type uses a hash to store different sized IP network address and interface name pairs.
 	TypeHashNetIface = "hash:net,iface"
+	// TypeListSet The bitmap:port type uses a memory range to store port numbers.
+	TypeBitmapPort = "bitmap:port"
 	// TypeListSet The list:set type uses a simple list in which you can store set names.
 	TypeListSet = "list:set"
 
@@ -82,37 +86,42 @@ const (
 	OptionForceAdd = "forceadd"
 )
 
-const TmpTableSuffix = "-"
-
-const Vmanual Proto = 255
+const (
+	TmpTableSuffix       = "-"
+	VRaw           Proto = 255
+	asyncQueueSize       = 5
+)
 
 var protoRelatedOptions = []string{OptionFamilly, FamillyInet6, FamillyInet, TypeManual}
 
 var perProtocolNamePrefix = map[Proto]string{
-	V4:      "v4:",
-	V6:      "v6:",
-	Vmanual: "",
+	V4:   "v4:",
+	V6:   "v6:",
+	VRaw: "",
 }
 
-var ipSetPath string
+var bufferPool = sync.Pool{New: func() interface{} {
+	return &bytes.Buffer{}
+}}
 
 // IPSet represent ipset sets managed by.
 type IPSet struct {
-	ipSetPath *string
-	Sets      map[string]*Set
+	Sets map[string]*Set
 }
 
-type entryListType []*Entry
-type PerProtoEntryMapType map[Proto]entryListType
+type EntriesMapType map[uint32]*Entry
+type PerProtoEntryMapType map[Proto]EntriesMapType
 
 // Set reprensent a ipset set entry.
 type Set struct {
+	sync.Mutex
+
 	Parent   *IPSet
 	Name     string
-	lock     *utils.ChannelLockType
 	Entries  PerProtoEntryMapType
 	Options  []string
 	isManual bool
+	exists   bool
 }
 
 // Entry of ipset Set.
@@ -121,23 +130,27 @@ type Entry struct {
 	Options []string
 }
 
-type asyncRequestType struct {
+type requestType struct {
 	set          *Set
 	entries      interface{}
 	extraOptions []string
 }
 
 type asyncDataChannelType struct {
-	fn func(*asyncRequestType) error
-	*asyncRequestType
+	fn func(*requestType) error
+	*requestType
 }
 
 var asyncDataChannel chan asyncDataChannelType
 
+type asyncIpSetWorker struct {
+	async_worker.Worker
+	dataChannel chan asyncDataChannelType
+}
+
 func init() {
-	ipSetPath = utils.GetPath("ipset")
-	asyncDataChannel = make(chan asyncDataChannelType, 15)
-	go backgroundWorker()
+	asyncDataChannel = make(chan asyncDataChannelType, asyncQueueSize)
+	async_worker.GlobalManager.AddWorkerRoutine(&asyncIpSetWorker{dataChannel: asyncDataChannel}, "IpSet bg worker")
 }
 
 // Used to run ipset binary with args and return stdout.
@@ -148,13 +161,13 @@ func (ipset *IPSet) run(namePos int, args ...string) (string, error) {
 // Used to run ipset binary with arg and inject stdin buffer and return stdout.
 func (ipset *IPSet) runWithStdin(stdin *bytes.Buffer, namePos int, args ...string) (string, error) {
 	var err error
-	var stderr bytes.Buffer
-	var stdout bytes.Buffer
+	var stderr = bufferPool.Get().(*bytes.Buffer)
+	var stdout = bufferPool.Get().(*bytes.Buffer)
 	cmd := exec.Cmd{
-		Path:   *ipset.ipSetPath,
-		Args:   append([]string{*ipset.ipSetPath}, args...),
-		Stderr: &stderr,
-		Stdout: &stdout,
+		Path:   tools.GetExecPath("ipset"),
+		Args:   append([]string{tools.GetExecPath("ipset")}, args...),
+		Stderr: stderr,
+		Stdout: stdout,
 	}
 
 	if stdin != nil {
@@ -162,7 +175,8 @@ func (ipset *IPSet) runWithStdin(stdin *bytes.Buffer, namePos int, args ...strin
 	}
 
 	if err = cmd.Run(); err != nil {
-		err = errors.New(stderr.String())
+		err = tools.NewErrorf("error: %s\nfailed cmd: %s\nstdin: %s", stderr.String(),
+			strings.Join(cmd.Args, " "), stdin.String())
 	}
 	// manipulating ipset(s) can be costly (long). that's why repetitive calls to ipset.Create() etc
 	// were replaced by GetOrCreate() (this assuming that original intention to call Create() repetitively
@@ -185,17 +199,16 @@ func (ipset *IPSet) runWithStdin(stdin *bytes.Buffer, namePos int, args ...strin
 	}
 
 	if err != nil {
-		return "", err
+		return "ipset call failed", err
 	}
 
 	return stdout.String(), nil
 }
 
-// NewIPSet create a new IPSet with ipSetPath initialized.
+// NewIPSet create a new IPSet with IpSetPath initialized.
 func NewIPSet() *IPSet {
 	ipSet := &IPSet{
-		ipSetPath: &ipSetPath,
-		Sets:      make(map[string]*Set),
+		Sets: make(map[string]*Set),
 	}
 	return ipSet
 }
@@ -210,28 +223,18 @@ func (ipset *IPSet) Create(setName string, createOptions ...string) (*Set, error
 			Name:     setName,
 			Options:  removeFamily(createOptions),
 			Parent:   ipset,
-			lock:     utils.NewChanLock(),
 			Entries:  make(PerProtoEntryMapType),
-			isManual: utils.CheckForElementInArray(TypeManual, createOptions),
+			isManual: tools.CheckForElementInArray(TypeManual, createOptions),
 		}
 	}
 
 	// Determine if set with the same name is already active on the system
 	if err := ipset.Sets[setName].Create(); err != nil {
-		return nil, fmt.Errorf("Failed to create ipset set %s: %s",
-			setName, err)
+		return nil, fmt.Errorf("Failed to create ipset %s: %s",
+			setName, err.Error())
 	}
+	ipset.Sets[setName].exists = true
 	return ipset.Sets[setName], nil
-}
-
-// Adds a given Set to an IPSet
-func (ipset *IPSet) Add(set *Set) error {
-	_, err := ipset.Create(set.Name, set.Options...)
-	if err != nil {
-		return err
-	}
-
-	return ipset.Get(set.Name).CopyEntriesFrom(set)
 }
 
 func (set *Set) create(p Proto, options ...string) error {
@@ -242,71 +245,17 @@ func (set *Set) create(p Proto, options ...string) error {
 	return nil
 }
 
-func (set *Set) CopyEntriesFrom(setFrom *Set) error {
-	return set.perProtoMethodWrapper(set._copyEntriesFrom, setFrom)
-}
-
-func (set *Set) _copyEntriesFrom(p Proto, args ...interface{}) error {
-	setFrom := args[0].(*Set)
-	for _, entry := range setFrom.Entries[p] {
-		if _, err := set.Parent.Get(set.Name).Add(entry.Options...); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// Add a given entry to the set. If the -exist option is specified, ipset
-// ignores if the entry already added to the set.
-func (set *Set) Add(addOptions ...string) (*Entry, error) {
-	set.lock.Lock()
-	defer set.lock.Unlock()
-
-	entry := &Entry{
-		Set:     set,
-		Options: addOptions,
-	}
-	proto := entry.getProtocol()
-	set.Entries[proto] = append(set.Entries[proto], entry)
-	_, err := set.Parent.run(2, append([]string{"add", "-exist", entry.Set.name(proto)}, addOptions...)...)
-	if err != nil {
-		return nil, err
-	}
-	return entry, nil
-}
-
 func entryRecordsSplitter(r rune) bool {
 	return r == '-' || r == ','
 }
 
 func (entry *Entry) getProtocol() Proto {
-	return Proto(NewIP(strings.FieldsFunc(entry.Options[0], entryRecordsSplitter)[0]).Protocol())
-}
-
-// Del an entry from a set. If the -exist option is specified and the entry is
-// not in the set (maybe already expired), then the command is ignored.
-func (entry *Entry) Del() error {
-	_, err := entry.Set.Parent.run(1, append([]string{"del", entry.Set.name(entry.getProtocol())}, entry.Options...)...)
-	if err != nil {
-		return err
-	}
-	entry.Set.Parent.Save()
-	return nil
-}
-
-// Test wether an entry is in a set or not. Exit status number is zero if the
-// tested entry is in the set and nonzero if it is missing from the set.
-func (set *Set) Test(testOptions ...string) (bool, error) {
-	_, err := set.Parent.run(1, append([]string{"test", set.name((&Entry{Options: testOptions}).getProtocol())}, testOptions...)...)
-	if err != nil {
-		return false, err
-	}
-	return true, nil
+	return NewIP(strings.FieldsFunc(entry.Options[0], entryRecordsSplitter)[0]).Protocol()
 }
 
 // Destroy the specified set or all the sets if none is given. If the set has
 // got reference(s), nothing is done and no set destroyed.
-func (set *Set) Destroy(*asyncRequestType) error {
+func (set *Set) Destroy(*requestType) error {
 	_, _ = set.Parent.run(0, "destroy", set.Name)
 	for p := range UsedTcpProtocols {
 		_, err := set.Parent.run(0, "destroy", set.name(p))
@@ -314,9 +263,10 @@ func (set *Set) Destroy(*asyncRequestType) error {
 			glog.Errorf("%s - %s", set.name(p), err.Error())
 		}
 	}
-	if !strings.HasSuffix(set.Name, "-") {
+	if !strings.HasSuffix(set.Name, TmpTableSuffix) {
 		set.Parent.Destroy(set.Name + TmpTableSuffix)
 	}
+	set.Parent.Sets[set.Name] = nil
 	delete(set.Parent.Sets, set.Name)
 	return nil
 }
@@ -360,7 +310,7 @@ func (set *Set) IsActive(p Proto) (exists bool, err error) {
 }
 
 func (set *Set) Create() (err error) {
-	err = set.getActiveProtocols().ForEach(func(p Proto) error {
+	err = UsedTcpProtocols.ForEach(func(p Proto) error {
 		if is, err := set.createForProto(p, true); !is || err != nil {
 			return err
 		}
@@ -395,7 +345,7 @@ func (set *Set) createUnionSet() (err error) {
 		return err
 	} else if err != nil {
 		create = true
-	} else if err == nil && !strings.Contains(out, "Type: list:set") {
+	} else if !strings.Contains(out, "Type: list:set") {
 		create = true
 		IptablesCleanRule(handler, V4, IpTablesCleanupRuleType{RuleContaining: []string{set.Name}}, true)
 		if _, err = set.Parent.run(0, "destroy", set.Name); err != nil {
@@ -415,15 +365,19 @@ func (set *Set) createUnionSet() (err error) {
 }
 
 func (set *Set) getActiveProtocols() ProtocolMapType {
-	pt := ProtocolMapType{}
 	if set.isManual {
-		return ProtocolMapType{Vmanual: true}
+		return ProtocolMapType{VRaw: true}
 	}
+
+	var pt = ProtocolMapType{}
 	for key := range set.Entries {
 		pt[key] = true
+		if len(pt) == len(UsedTcpProtocols) {
+			return pt
+		}
 	}
 	if len(pt) == 0 {
-		return ProtocolMapType{V6: true, V4: true}
+		return UsedTcpProtocols
 	}
 	return pt
 }
@@ -442,7 +396,7 @@ func (set *Set) name(p Proto) string {
 func removeFamily(options []string) []string {
 	newOptions := make([]string, 0)
 	for _, o := range options {
-		if utils.CheckForElementInArray(o, protoRelatedOptions) {
+		if tools.CheckForElementInArray(o, protoRelatedOptions) {
 			continue
 		}
 		newOptions = append(newOptions, o)
@@ -481,6 +435,9 @@ func parseIPSetSave(ipset *IPSet, result string) map[string]*Set {
 		}
 		name, proto := getNameAndProto(content[1])
 		if name == "" {
+			if sets[content[1]] != nil {
+				sets[content[1]].exists = true
+			}
 			continue
 		}
 		if content[0] == "create" && sets[name] == nil {
@@ -490,13 +447,9 @@ func parseIPSetSave(ipset *IPSet, result string) map[string]*Set {
 				Options: removeFamily(content[2:]),
 			}
 			sets[name].Entries = make(PerProtoEntryMapType)
-			sets[name].lock = utils.NewChanLock()
 		} else if content[0] == "add" {
 			set := sets[name]
-			set.Entries[proto] = append(set.Entries[proto], &Entry{
-				Set:     set,
-				Options: content[2:],
-			})
+			set.Entries.Add(proto, &Entry{set, content[2:]})
 		}
 	}
 
@@ -519,7 +472,7 @@ func getNameAndProto(s string) (string, Proto) {
 // create KUBE-DST-3YNVZWWGX3UQQ4VQ hash:ip family inet hashsize 1024 maxelem 65536 timeout 0
 // add KUBE-DST-3YNVZWWGX3UQQ4VQ 100.96.1.6 timeout 0
 func (set *Set) buildIPSetRestore(buf *bytes.Buffer) *bytes.Buffer {
-	for p := range UsedTcpProtocols {
+	for p := range *UsedTcpProtocols.Copy().Merge(&ProtocolMapType{VRaw: true}) {
 		fmt.Fprintf(buf, "create %s %s\n", set.name(p), strings.Join(set.addFamily(p, set.Options)[:], " "))
 		for _, entry := range set.Entries[p] {
 			fmt.Fprintf(buf, "add %s %s\n", set.name(p), strings.Join(entry.Options[:], " "))
@@ -533,10 +486,7 @@ func (set *Set) buildIPSetRestore(buf *bytes.Buffer) *bytes.Buffer {
 // adapted setName (name prefix) or options ( inet/inet6 family opt )
 func (set *Set) perProtoMethodWrapper(f func(Proto, ...interface{}) error, args ...interface{}) (err error) {
 	return set.getActiveProtocols().ForEach(func(p Proto) error {
-		if err = f(p, args...); err != nil {
-			return err
-		}
-		return nil
+		return f(p, args...)
 	})
 }
 
@@ -547,6 +497,7 @@ func (set *Set) perProtoMethodWrapper(f func(Proto, ...interface{}) error, args 
 func (ipset *IPSet) Save() error {
 	stdout, err := ipset.run(0, "save")
 	if err != nil {
+		glog.Errorf("Failed loading existing IPSets: %s", err.Error())
 		return err
 	}
 	ipset.Sets = parseIPSetSave(ipset, stdout)
@@ -559,21 +510,22 @@ func (ipset *IPSet) SaveSimpleList() (*map[string]*Set, error) {
 		return nil, err
 	}
 
+	var simpleIPSet = IPSet{Sets: make(map[string]*Set)}
 	lines := strings.Split(stdout, "\n")
 	for _, line := range lines {
 		name, _ := getNameAndProto(line)
 		if name == "" {
 			name = line
 		}
-		if name == "" || ipset.Sets[name] != nil {
+		if name == "" || simpleIPSet.Sets[name] != nil {
 			continue
 		}
-		ipset.Sets[name] = &Set{
+		simpleIPSet.Sets[name] = &Set{
 			Parent: ipset,
 			Name:   name,
 		}
 	}
-	return &ipset.Sets, nil
+	return &simpleIPSet.Sets, nil
 }
 
 // Restore a saved session generated by save. The saved session can be fed from
@@ -583,7 +535,7 @@ func (ipset *IPSet) SaveSimpleList() (*map[string]*Set, error) {
 // mode except list, help, version, interactive mode and restore itself.
 // Send formated ipset.sets into stdin of "ipset restore" command.
 func (ipset *IPSet) Restore() (err error) {
-	var buf = &bytes.Buffer{}
+	var buf = bufferPool.Get().(*bytes.Buffer)
 	for _, set := range ipset.Sets {
 		set.buildIPSetRestore(buf)
 	}
@@ -591,11 +543,13 @@ func (ipset *IPSet) Restore() (err error) {
 }
 
 func (set *Set) Restore() error {
-	return set.Parent._restore(set.buildIPSetRestore(&bytes.Buffer{}))
+	return set.Parent._restore(set.buildIPSetRestore(bufferPool.Get().(*bytes.Buffer)))
 }
 
 func (ipset *IPSet) _restore(buf *bytes.Buffer) error {
 	_, err := ipset.runWithStdin(buf, 0, "restore", "-exist")
+	buf.Reset()
+	bufferPool.Put(buf)
 	if err != nil {
 		return err
 	}
@@ -626,7 +580,7 @@ func (ipset *IPSet) Flush() error {
 }
 
 func (ipset *IPSet) GetOrCreate(setName string, options ...string) (set *Set, err error) {
-	if set = ipset.Sets[setName]; set == nil {
+	if set = ipset.Sets[setName]; set == nil || !set.exists {
 		return ipset.Create(setName, options...)
 	}
 	return
@@ -668,34 +622,43 @@ func (set *Set) _swap(p Proto, args ...interface{}) (err error) {
 	return err
 }
 
-func (set *Set) Append(options ...string) {
-	if options[0] == "" {
-		return
+func (set *Set) Append(options ...string) *Entry {
+	if len(options) < 1 || options[0] == "" {
+		return nil
 	}
 	entry := &Entry{
 		Set:     set,
 		Options: options,
 	}
-	proto := entry.getProtocol()
-	set.Entries[proto] = append(set.Entries[proto], entry)
+	return set.Entries.Add(entry.getProtocol(), entry)
 }
 
-// Refresh a Set with new entries.
-//func (set *Set) _refresh(entries interface{}, extraOptions ...string) (err error) {
-func (set *Set) _refresh(in *asyncRequestType) (err error) {
-	set.lock.Lock()
-	defer set.lock.Unlock()
+func (e PerProtoEntryMapType) Add(proto Proto, entry *Entry) *Entry {
+	if e[proto] == nil {
+		e[proto] = make(EntriesMapType)
+	}
+	hash := tools.GetHash(fmt.Sprint(entry.Options))
+	if e[proto][hash] != nil {
+		return nil
+	}
+	e[proto][hash] = entry
+	return entry
+}
 
-	// The set-name must be < 32 characters!
-	tmpSet := &Set{
+func (set *Set) getTmpSet() *Set {
+	return &Set{
 		Parent:   set.Parent,
 		Name:     set.Name + TmpTableSuffix,
 		Options:  set.Options,
 		Entries:  make(PerProtoEntryMapType),
 		isManual: set.isManual,
 	}
+}
 
-	switch eTyped := in.entries.(type) {
+func (set *Set) Prepare(entries interface{}) *Set {
+	tmpSet := set.getTmpSet()
+
+	switch eTyped := entries.(type) {
 	case []string:
 		for _, e := range eTyped {
 			tmpSet.Append(e)
@@ -706,14 +669,21 @@ func (set *Set) _refresh(in *asyncRequestType) (err error) {
 		}
 	case []*net.IPNet:
 		for _, e := range eTyped {
-			tmpSet.Append(e.IP.String())
+			if !e.IP.Equal(net.IP{}) {
+				tmpSet.Append(e.IP.String())
+			}
 		}
 	case PerProtoEntryMapType:
 		tmpSet.Entries = eTyped
 	default:
 		tmpSet.Flush()
-		return fmt.Errorf("IPSet refresh: Unknown type while reading records for IPSet %s, %T", set.Name, in.entries)
+		glog.Errorf("IPSet refresh: Unknown type while reading records for IPSet %s, %T", set.Name, entries)
 	}
+
+	return tmpSet
+}
+
+func (set *Set) CommitWithSet(tmpSet *Set) (err error) {
 	err = tmpSet.Restore()
 
 	if err == nil {
@@ -724,13 +694,24 @@ func (set *Set) _refresh(in *asyncRequestType) (err error) {
 	if err == nil {
 		err = tmpSet.Flush()
 	}
-
 	return
 }
 
 // Refresh a Set with new entries.
+//func (set *Set) _refresh(entries interface{}, extraOptions ...string) (err error) {
+func (set *Set) refresh(in *requestType) (err error) {
+	set.Lock()
+	defer set.Unlock()
+	return set.CommitWithSet(set.Prepare(in.entries))
+}
+
+func (set *Set) Commit() error {
+	return set.RefreshWithEntries(set.Entries)
+}
+
+// Refresh a Set with new entries.
 func (set *Set) Refresh(entries interface{}, extraOptions ...string) (err error) {
-	return set._refresh(&asyncRequestType{set, entries, extraOptions})
+	return set.refresh(&requestType{set, entries, extraOptions})
 }
 
 // Refresh a Set with new entries with built-in options.
@@ -742,25 +723,27 @@ func (set *Set) RefreshWithEntries(entries PerProtoEntryMapType) error {
 	return set.Refresh(entries)
 }
 
-func backgroundWorker() {
-	for {
-		for data := range asyncDataChannel {
-			if err := data.fn(data.asyncRequestType); err != nil {
-				glog.Errorf("Failed to update %s: %s", data.set.Name, err)
-			}
+func (bw *asyncIpSetWorker) StopWorker() {
+	close(bw.dataChannel)
+}
+
+func (bw *asyncIpSetWorker) StartWorker() {
+	go bw.backgroundWorker()
+}
+
+func (bw *asyncIpSetWorker) backgroundWorker() {
+	for data := range bw.dataChannel {
+		if err := data.fn(data.requestType); err != nil {
+			glog.Errorf("Failed to update %s: %s", data.set.Name, err)
 		}
 	}
+	glog.V(3).Infof("%s done", bw.GetName())
+	bw.Done()
 }
 
 func (set *Set) RefreshAsync(entries interface{}, extraOptions ...string) {
 	if set != nil {
-		asyncDataChannel <- asyncDataChannelType{set._refresh,
-			&asyncRequestType{set, entries, extraOptions}}
-	}
-}
-
-func (set *Set) DestroyAsync() {
-	if set != nil {
-		asyncDataChannel <- asyncDataChannelType{set.Destroy, nil}
+		asyncDataChannel <- asyncDataChannelType{set.refresh,
+			&requestType{set, entries, extraOptions}}
 	}
 }

@@ -10,19 +10,21 @@ import (
 
 	"github.com/cloudnativelabs/kube-router/pkg/controllers"
 	"github.com/cloudnativelabs/kube-router/pkg/healthcheck"
+	"github.com/cloudnativelabs/kube-router/pkg/helpers/api"
+	"github.com/cloudnativelabs/kube-router/pkg/helpers/hostconf"
+	"github.com/cloudnativelabs/kube-router/pkg/helpers/hostnet"
+	"github.com/cloudnativelabs/kube-router/pkg/helpers/tools"
 	"github.com/cloudnativelabs/kube-router/pkg/metrics"
 	"github.com/cloudnativelabs/kube-router/pkg/options"
-	"github.com/cloudnativelabs/kube-router/pkg/utils"
-	"github.com/cloudnativelabs/kube-router/pkg/utils/net-tools"
+	"github.com/eapache/channels"
 	"github.com/golang/glog"
 	"github.com/google/go-cmp/cmp"
 	"github.com/prometheus/client_golang/prometheus"
-	api "k8s.io/api/core/v1"
+	k8sapi "k8s.io/api/core/v1"
 	apiextensions "k8s.io/api/extensions/v1beta1"
 	networking "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/client-go/kubernetes"
 	listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"regexp"
@@ -50,7 +52,6 @@ const (
 )
 
 var (
-	CONTROLLER_NAME        = []string{"Policy controller", "NPC"}
 	kubeCleanupChainPrefix = []string{"KUBE-POD-FW-", "KUBE-POD-OUT-", "KUBE-POD-IN-"}
 	kubeCleanupIpSetPrefix = []string{"KUBE-DST-", "KUBE-SRC-", kubeForwardRejectIpSet, "KUBE-TGTI"}
 
@@ -70,83 +71,77 @@ var (
 
 // NetworkPolicyController strcut to hold information required by NetworkPolicyController
 type NetworkPolicyController struct {
-	nodeIP          net.IP
-	nodeHostName    string
-	mu              *utils.ControllerSyncLockType
-	syncPeriod      time.Duration
+	controllers.Controller
+
+	mu              sync.Mutex
 	MetricsEnabled  bool
 	v1NetworkPolicy bool
 	readyForUpdates bool
-	clientset       kubernetes.Interface
+	rejectTargets   []string
+
+	activeRecordSetPool *sync.Pool
 
 	// list of all active network policies expressed as networkPolicyInfo
-	networkPoliciesInfo *networkPolicyInfoListType
-	ipSetHandler        *netutils.IPSet
+	networkPoliciesInfo networkPolicyInfoListType
+	ipSetHandler        *hostnet.IPSet
 
-	podLister cache.Indexer
-	npLister  cache.Indexer
-	nsLister  cache.Indexer
-	epLister  cache.Indexer
-	svcLister cache.Indexer
+	podLister  cache.Indexer
+	npLister   cache.Indexer
+	nsLister   cache.Indexer
+	epLister   cache.Indexer
+	svcLister  cache.Indexer
+	nodeLister cache.Indexer
 
 	PodEventHandler           cache.ResourceEventHandler
 	NamespaceEventHandler     cache.ResourceEventHandler
 	NetworkPolicyEventHandler cache.ResourceEventHandler
+	NodesEventHandler         cache.ResourceEventHandler
 
-	Ipm      *netutils.IpTablesManager
-	cfgCheck *utils.ConfigCheckType
+	Ipm      *hostnet.IpTablesManager
+	cfgCheck *hostconf.ConfigCheckType
 }
 
 type networkPolicyInfoListType map[string]*networkPolicyInfo
 
-var data keyMetrics
+var metricsData keyMetrics
 
-var timer *time.Timer
-var afterPickupOnce *sync.Once
-var updatesQueue chan *utils.ApiTransaction
+const synchQueueChannelSize = 7
 
-func init() {
-	timer = nil
-	updatesQueue = make(chan *utils.ApiTransaction, 15)
-	afterPickupOnce = &sync.Once{}
-}
-
-func (npc *NetworkPolicyController) GetData() ([]string, time.Duration) {
-	return CONTROLLER_NAME, npc.syncPeriod
-}
+var afterPickupOnce = new(sync.Once)
+var updatesQueue = channels.NewBatchingChannel(synchQueueChannelSize)
+var hashSlicePool = sync.Pool{
+	New: func() interface{} {
+		return make([]uint64, 0, synchQueueChannelSize)
+	}}
 
 // Run runs forver till we receive notification on stopCh
-func (npc *NetworkPolicyController) Run(healthChan chan *controllers.ControllerHeartbeat, stopCh <-chan struct{}, wg *sync.WaitGroup) error {
-	t := time.NewTicker(npc.syncPeriod)
+func (npc *NetworkPolicyController) run(stopCh <-chan struct{}) (err error) {
+	t := time.NewTicker(npc.GetSyncPeriod())
 	obsoleteResourceCleanupOnce := &sync.Once{}
-	defer t.Stop()
-	defer wg.Done()
+	defer func() {
+		glog.Infof("Shutting down %s", npc.GetControllerName())
+		t.Stop()
+	}()
 
-	npc.cfgCheck = utils.GetConfigChecker()
-	npc.cfgCheck.Register(npc, utils.ConfigCheck{utils.GetPath("ip6tables"), []string{"-t", "filter", "-S", "-w"}})
-	npc.cfgCheck.Register(npc, utils.ConfigCheck{utils.GetPath("iptables"), []string{"-t", "filter", "-S", "-w"}})
+	npc.cfgCheck = hostconf.GetConfigChecker()
+	npc.cfgCheck.Register(npc, hostconf.ConfigCheck{tools.GetExecPath("ip6tables"), []string{"-t", "filter", "-S", "-w"}})
+	npc.cfgCheck.Register(npc, hostconf.ConfigCheck{tools.GetExecPath("iptables"), []string{"-t", "filter", "-S", "-w"}})
+	npc.cfgCheck.Register(npc, hostconf.ConfigCheck{tools.GetExecPath("ipvsadm"), []string{"--save", "-n"}})
 
-	glog.Info("Starting network policy controller")
+	glog.Infof("Started %s", npc.GetControllerName())
 
 	// loop forever till notified to stop on stopCh
 	for {
-		select {
-		case <-stopCh:
-			glog.Info("Shutting down network policies controller")
-			return nil
-		default:
-		}
-
 		glog.V(1).Info("Performing periodic sync of iptables to reflect network policies")
-		err := npc.Sync()
-		if err != nil {
-			glog.Errorf("Error during periodic sync of network policies in network policy controller. Error: " + err.Error())
-			glog.Errorf("Skipping sending heartbeat from network policy controller as periodic sync failed.")
-		} else {
-			dataCopy := data
-			healthcheck.SendHeartBeat(healthChan, npc, dataCopy)
+		if updatesQueue.Len() == 0 {
+			if err = npc.Sync(); err != nil {
+				glog.Errorf("Error during periodic sync of network policies in network policy controller. Error: " + err.Error())
+				glog.Errorf("Skipping sending heartbeat from network policy controller as periodic sync failed.")
+			} else {
+				dataCopy := metricsData
+				healthcheck.SendHeartBeat(npc, dataCopy)
+			}
 		}
-
 		// Run obsolete resources cleanup after first full sync, not at the start. Those resources
 		// can be used by others until sync runs with new setting
 		obsoleteResourceCleanupOnce.Do(func() {
@@ -156,7 +151,6 @@ func (npc *NetworkPolicyController) Run(healthChan chan *controllers.ControllerH
 		npc.readyForUpdates = true
 		select {
 		case <-stopCh:
-			glog.Infof("Shutting down network policies controller")
 			return nil
 		case <-t.C:
 		}
@@ -174,10 +168,11 @@ func (npc *NetworkPolicyController) OnPodUpdate(obj interface{}) {
 // For now just don't run anything. all stuff needs to be present until services controller
 // doesn't tear down pod/service properly (with reroute, grace period etc)
 func (npc *NetworkPolicyController) OnPodDelete(obj interface{}) {
+	npc.cfgCheck.ForceNextRun(npc)
 }
 
-func (npc *NetworkPolicyController) updatePreChecks(obj interface{}) (pod *api.Pod) {
-	pod = obj.(*api.Pod)
+func (npc *NetworkPolicyController) updatePreChecks(obj interface{}) (pod *k8sapi.Pod) {
+	pod = obj.(*k8sapi.Pod)
 	glog.V(2).Infof("Received update to pod: %s/%s", pod.Namespace, pod.Name)
 
 	if !npc.readyForUpdates {
@@ -202,7 +197,7 @@ func (npc *NetworkPolicyController) OnNetworkPolicyUpdate(obj interface{}) {
 
 // OnNamespaceUpdate handles updates to namespace from kubernetes api server
 func (npc *NetworkPolicyController) OnNamespaceUpdate(obj interface{}) {
-	namespace := obj.(*api.Namespace)
+	namespace := obj.(*k8sapi.Namespace)
 	// namespace (and annotations on it) has no significance in GA ver of network policy
 	if npc.v1NetworkPolicy {
 		return
@@ -213,82 +208,86 @@ func (npc *NetworkPolicyController) OnNamespaceUpdate(obj interface{}) {
 }
 
 func (npc *NetworkPolicyController) queueUpdate(obj interface{}) {
-	afterPickupOnce.Do(func() {
-		npc.mu.Lock()
-		timer = time.AfterFunc(250*time.Millisecond, npc.pickupQueue)
-	})
-	updatesQueue <- &utils.ApiTransaction{New: obj}
+	updatesQueue.In() <- &tools.ApiTransaction{New: obj}
+	npc.scheduleQueueProcess(250 * time.Millisecond)
 }
 
-func (npc *NetworkPolicyController) pickupQueue() {
+func (npc *NetworkPolicyController) scheduleQueueProcess(after time.Duration) {
+	afterPickupOnce.Do(func() {
+		npc.mu.Lock()
+		time.AfterFunc(after, npc.updatesQueue)
+	})
+}
+
+func (npc *NetworkPolicyController) updatesQueue() {
 
 	start := time.Now()
-	defer npc.mu.Unlock()
+	defer func() {
+		npc.cfgCheck.ForceNextRun(npc)
+		npc.mu.Unlock()
+		if updatesQueue.Len() != 0 {
+			npc.scheduleQueueProcess(100 * time.Millisecond)
+		}
+	}()
 
-	dummyRecordSet := activeRecordSets{}.New()
-	activePolicyChains := activeRecordSets{}.New()
+	var activeIpSets = npc.activeRecordSetPool.Get().(*activeRecordSet)
+	var activePolicyChains = npc.activeRecordSetPool.Get().(*activeRecordSet)
 
-	var updatePolicies = &networkPolicyInfoListType{}
+	var updateHashes = hashSlicePool.Get().([]uint64)
+	var updatePolicies = make(networkPolicyInfoListType)
 	var updatedPods []interface{}
 	var updatedNamespaces []interface{}
 
-	var grouped = 0
+	var processed = updatesQueue.Len()
 
-	for {
-		select {
-		case upd := <-updatesQueue:
-			grouped++
+	for _, update := range (<-updatesQueue.Out()).([]interface{}) {
 
-			switch updTyped := upd.New.(type) {
-			case *api.Pod:
-				updatedPods = append(updatedPods, podInfo{}.fromApi(updTyped))
+		switch updTyped := update.(*tools.ApiTransaction).New.(type) {
+		case *k8sapi.Pod:
+			updatedPods = append(updatedPods, podInfo{}.fromApi(updTyped))
+			glog.V(3).Infof("Added pod %v to bulk change", *updTyped)
 
-			case *networking.NetworkPolicy:
-				updatePolicies.Add(npc.buildSinglePolicyInfo(updTyped))
+		case *networking.NetworkPolicy:
+			p := npc.buildSinglePolicyInfo(updTyped)
+			updateHashes = append(updateHashes, p.meta.hash)
+			glog.V(3).Infof("Added policy %v to bulk change", *updTyped)
 
-			case *api.Namespace:
-				updatedNamespaces = append(updatedNamespaces, updTyped)
-
-			default:
-			}
-
-		default:
-			afterPickupOnce = &sync.Once{}
-
-			updatePolicies.ForEach(func(p *networkPolicyInfo) {
-				npc.syncSingleNetworkPolicyChain(p, dummyRecordSet, activePolicyChains, true)
-			})
-
-			npc.syncPodFirewallChains(activePolicyChains, updatePolicies)
-
-			updatePolicies = &networkPolicyInfoListType{}
-
-			if len(updatedPods) > 0 {
-				npc.networkPoliciesInfo.ForEach(func(p *networkPolicyInfo) {
-					p.targetPods = npc.ListPodInfoByNamespaceAndLabels(p.meta.namespace, p.meta.labels.AsSelector())
-					p.parsePolicy(p.meta.source, npc.evalPodPeer)
-
-					npc.findAffectedPolicies(p, updatePolicies, updatedPods)
-					npc.findAffectedPolicies(p, updatePolicies, updatedNamespaces)
-				})
-
-				updatePolicies.ForEach(func(p *networkPolicyInfo) {
-					npc.syncSingleNetworkPolicyChain(p, dummyRecordSet, dummyRecordSet, false)
-				})
-			}
-
-			glog.V(0).Infof("Transaction sync policy controller took %v (consolidated %d changes)", time.Since(start), grouped)
-
-			npc.cfgCheck.ForceNextRun(npc)
-			return
+		case *k8sapi.Namespace:
+			updatedNamespaces = append(updatedNamespaces, updTyped)
+			glog.V(3).Infof("Added namespace %v to bulk change", *updTyped)
 		}
 	}
+
+	afterPickupOnce = &sync.Once{}
+	preparedIpSets := &preparedIpSetsType{}
+
+	npc.rebuildPolicyInfo()
+
+	npc.networkPoliciesInfo.ForEach(func(p *networkPolicyInfo) {
+		if tools.CheckForElementInArray(p.meta.hash, updateHashes) {
+			updatePolicies.Add(p)
+		}
+		npc.findAffectedPolicies(p, updatePolicies, updatedPods)
+		npc.findAffectedPolicies(p, updatePolicies, updatedNamespaces)
+	})
+
+	updatePolicies.ForEach(func(p *networkPolicyInfo) {
+		npc.syncSingleNetworkPolicyChain(p, activeIpSets, activePolicyChains, preparedIpSets, true)
+	})
+
+	npc.refreshIpSets(activeIpSets, preparedIpSets)
+	healthcheck.SendHeartBeat(npc, metricsData)
+
+	hashSlicePool.Put(updateHashes[:0])
+	npc.activeRecordSetPool.Put(activePolicyChains.Reset())
+	npc.activeRecordSetPool.Put(activeIpSets.Reset())
+	glog.Infof("Transaction sync policy controller took %v (processed %d changes)", time.Since(start), processed)
 }
 
-func (npc *NetworkPolicyController) findAffectedPolicies(p *networkPolicyInfo, plcs *networkPolicyInfoListType, slice []interface{}) {
+func (npc *NetworkPolicyController) findAffectedPolicies(p *networkPolicyInfo, plcs networkPolicyInfoListType, slice []interface{}) {
 	for _, obj := range slice {
 		switch typed := obj.(type) {
-		case *api.Namespace:
+		case *k8sapi.Namespace:
 			if p.checkNamespace(typed) {
 				plcs.Add(p)
 			}
@@ -300,37 +299,41 @@ func (npc *NetworkPolicyController) findAffectedPolicies(p *networkPolicyInfo, p
 	}
 }
 
+type preparedIpSetsType map[string]*hostnet.Set
+
 // Sync synchronizes iptables to desired state of network policies
 func (npc *NetworkPolicyController) Sync() (err error) {
-
 	npc.mu.Lock()
 	start := time.Now()
 
 	defer func() {
-		npc.mu.Unlock()
 		endTime := time.Since(start)
-		glog.V(0).Infof("Sync policy controller took %v", endTime)
+		npc.mu.Unlock()
+		glog.Infof("Sync policy controller took %v", endTime)
 		if npc.MetricsEnabled {
 			metrics.ControllerIptablesSyncTime.Observe(endTime.Seconds())
 		}
-		data.lastSync = endTime
+		metricsData.lastSync = endTime
 	}()
 
+	npc.ipSetHandler.Save()
+	if err = npc.syncNodesIPSet(); err != nil {
+		return errors.New("Aborting sync. Failed to sync cluster nodes ipset: " + err.Error())
+	}
+
 	if !npc.cfgCheck.GetCheckResult(npc) {
+		npc.addExtraSets(nil)
 		return
 	}
 
-	data = keyMetrics{pods: len(npc.podLister.List())}
+	preparedIpSets := make(preparedIpSetsType)
+	metricsData = keyMetrics{pods: len(npc.podLister.List())}
 
 	if err = npc.rebuildPolicyInfo(); err != nil {
 		return err
 	}
 
-	if err = npc.syncNodesIPSet(); err != nil {
-		return errors.New("Aborting sync. Failed to sync cluster nodes ipset: " + err.Error())
-	}
-
-	activePolicyChains, activePolicyIpSets, err := npc.syncNetworkPolicyChains()
+	activePolicyChains, activePolicyIpSets, err := npc.syncNetworkPolicyChains(&preparedIpSets)
 	if err != nil {
 		return errors.New("Aborting sync. Failed to sync network policy chains: " + err.Error())
 	}
@@ -345,8 +348,10 @@ func (npc *NetworkPolicyController) Sync() (err error) {
 		return errors.New("Aborting sync. Failed to sync pod firewalls: " + err.Error())
 	}
 
-	data.ipsets = activePolicyIpSets.Size()
-	data.chains = activePolicyChains.Size() + activePodInChains.Size() + activePodOutChains.Size()
+	metricsData.ipsets = activePolicyIpSets.Size()
+	metricsData.chains = activePolicyChains.Size() + activePodInChains.Size() + activePodOutChains.Size()
+
+	npc.refreshIpSets(activePolicyIpSets, &preparedIpSets)
 
 	err = npc.cleanupStaleRules(activePolicyChains, activePodInChains, activePodOutChains, activePolicyIpSets)
 	if err != nil {
@@ -356,19 +361,36 @@ func (npc *NetworkPolicyController) Sync() (err error) {
 	return nil
 }
 
-func (npc *NetworkPolicyController) addExtraSets(activePolicyIpSets *activeRecordSets) (err error) {
-	icmpIpSet, _ := npc.ipSetHandler.GetOrCreate(kubeICMPIpSet, netutils.TypeHashNetPort)
-	for _, option := range icmpIpSetSource {
-		if _, err = icmpIpSet.Add(option); err != nil {
-			return err
-		}
-	}
+func (npc *NetworkPolicyController) refreshIpSets(ipSets *activeRecordSet, preparedIpSets *preparedIpSetsType) {
+	start := time.Now()
+	defer glog.Infof("Refreshing ipSets took %v", time.Since(start))
 
-	activePolicyIpSets.Add(kubeICMPIpSet)
+	ipSets.ForEach(func(ipset string) {
+		set := npc.ipSetHandler.Get(ipset)
+		if set == nil || (*preparedIpSets)[set.Name] == nil {
+			return
+		}
+		set.CommitWithSet((*preparedIpSets)[set.Name])
+	})
+}
+
+func (npc *NetworkPolicyController) addExtraSets(activePolicyIpSets *activeRecordSet) (err error) {
+	start := time.Now()
+	defer glog.Infof("Syncing extra sets took %v", time.Since(start))
+
+	icmpIpSet, _ := npc.ipSetHandler.GetOrCreate(kubeICMPIpSet, hostnet.TypeHashNetPort)
+	icmpIpSet.RefreshAsync(icmpIpSetSource)
+
+	if activePolicyIpSets != nil {
+		activePolicyIpSets.Add(kubeICMPIpSet)
+	}
 	return
 }
 
 func (npc *NetworkPolicyController) rebuildPolicyInfo() (err error) {
+	start := time.Now()
+	defer glog.Infof("Rebuild policy info took %v", time.Since(start))
+
 	if npc.v1NetworkPolicy {
 		npc.networkPoliciesInfo, err = npc.buildNetworkPoliciesInfo()
 		if err != nil {
@@ -389,20 +411,23 @@ func (npc *NetworkPolicyController) rebuildPolicyInfo() (err error) {
 // is used for matching destination ip address. Each ingress rule in the network
 // policyspec is evaluated to set of matching pods, which are grouped into a
 // ipset used for source ip addr matching.
-func (npc *NetworkPolicyController) syncNetworkPolicyChains() (*activeRecordSets, *activeRecordSets, error) {
+func (npc *NetworkPolicyController) syncNetworkPolicyChains(preparedIpSets *preparedIpSetsType) (*activeRecordSet, *activeRecordSet, error) {
 	start := time.Now()
 	defer func() {
 		endTime := time.Since(start)
-		glog.V(0).Infof("Syncing network policy chains took %v", endTime)
+		glog.Infof("Syncing network policy chains took %v", endTime)
+		if npc.MetricsEnabled {
+			metrics.ControllerPolicyChainsSyncTime.Observe(endTime.Seconds())
+		}
 	}()
 
 	var err error
-	var activePolicyChains = activeRecordSets{}.New()
-	var activePolicyIpSets = activeRecordSets{}.New()
+	var activePolicyChains = npc.activeRecordSetPool.Get().(*activeRecordSet)
+	var activePolicyIpSets = npc.activeRecordSetPool.Get().(*activeRecordSet)
 
 	// run through all network policies
 	npc.networkPoliciesInfo.ForEach(func(policy *networkPolicyInfo) {
-		if err = npc.syncSingleNetworkPolicyChain(policy, activePolicyIpSets, activePolicyChains, true); err != nil {
+		if err = npc.syncSingleNetworkPolicyChain(policy, activePolicyIpSets, activePolicyChains, preparedIpSets, false); err != nil {
 			return
 		}
 	})
@@ -413,20 +438,21 @@ func (npc *NetworkPolicyController) syncNetworkPolicyChains() (*activeRecordSets
 
 	glog.V(2).Infof("Iptables chains in the filter table are synchronized with the network policies.")
 
-	data.policies += npc.networkPoliciesInfo.Size()
+	metricsData.policies += npc.networkPoliciesInfo.Size()
 	return activePolicyChains, activePolicyIpSets, nil
 }
 
 func (npc *NetworkPolicyController) syncSingleNetworkPolicyChain(policy *networkPolicyInfo, activePolicyIpSets,
-	activePolicyChains *activeRecordSets, withRules bool) (err error) {
+	activePolicyChains *activeRecordSet, preparedIpSets *preparedIpSetsType, force bool) (err error) {
 
 	targetPodIpSetName := kubeTargetIpSetPrefix.GetFromMeta(policy.meta)
 
 	// create an ipset for all targets pod matched by the policy spec PodSelector
 	// if not exists yet (many policies can have same PodSelector)
-	if !activePolicyIpSets.Contains(targetPodIpSetName) {
+	if force || !activePolicyIpSets.Contains(targetPodIpSetName) {
 
-		targetPodIpSet, err := npc.ipSetHandler.Create(targetPodIpSetName, netutils.TypeHashIP, netutils.OptionTimeout, "0")
+		/**/
+		targetPodIpSet, err := npc.ipSetHandler.GetOrCreate(targetPodIpSetName, hostnet.TypeHashIP, hostnet.OptionTimeout, "0")
 		if err != nil {
 			return fmt.Errorf("failed to create ipset: %s", err.Error())
 		}
@@ -438,27 +464,25 @@ func (npc *NetworkPolicyController) syncSingleNetworkPolicyChain(policy *network
 			currentPodIps = append(currentPodIps, pod.ip...)
 		})
 
-		targetPodIpSet.RefreshAsync(currentPodIps)
+		(*preparedIpSets)[targetPodIpSet.Name] = targetPodIpSet.Prepare(currentPodIps)
 	}
 
-	if !withRules {
-		return
-	}
-	err = npc.processRules(policy, activePolicyChains, activePolicyIpSets)
+	err = npc.processRules(policy, activePolicyChains, activePolicyIpSets, preparedIpSets)
 	return
 }
 
-func (npc *NetworkPolicyController) processRules(policy *networkPolicyInfo, activePolicyChains, activePolicyIpSets *activeRecordSets) (err error) {
+func (npc *NetworkPolicyController) processRules(policy *networkPolicyInfo, activePolicyChains, activePolicyIpSets *activeRecordSet,
+	preparedIpSets *preparedIpSetsType) (err error) {
 
 	// run through all the ingress rules in the spec and create iptables rules
 	// in the chain for the network policy
 	err = policy.ingressRules.processPolicyRules(policy, &policy.ingressRules, npc.ipSetHandler,
-		activePolicyChains, activePolicyIpSets, npc.Ipm)
+		activePolicyChains, activePolicyIpSets, preparedIpSets, npc.Ipm)
 	// run through all the egress rules in the spec and create iptables rules
 	// in the chain for the network policy
 	if err == nil {
 		err = policy.egressRules.processPolicyRules(policy, &policy.egressRules, npc.ipSetHandler,
-			activePolicyChains, activePolicyIpSets, npc.Ipm)
+			activePolicyChains, activePolicyIpSets, preparedIpSets, npc.Ipm)
 	}
 	return
 }
@@ -478,7 +502,7 @@ type ruleTemplate struct {
 
 var ipSetDirection = [][]string{{"dst", "from"}, {"src", "to"}}
 
-func getTemplate(rt templateType, meta *networkPolicyMetadata, generated string, directionOffset int) *[]string {
+func getTemplate(rt templateType, meta *networkPolicyMetadata, generated string, directionOffset int) []string {
 	var tmpl *ruleTemplate
 
 	switch rt {
@@ -503,58 +527,58 @@ func getTemplate(rt templateType, meta *networkPolicyMetadata, generated string,
 	}
 	var out = tmpl.rule
 	out = append(out, tmpl.comment...)
-	return &out
+	return out
 }
 
-func (pr *policyRuleIngress) getTemplate(rt templateType, meta *networkPolicyMetadata, generated string) *[]string {
+func (pr *policyRuleIngress) getTemplate(rt templateType, meta *networkPolicyMetadata, generated string) []string {
 	return getTemplate(rt, meta, generated, 0)
 }
 
-func (pr *policyRuleEgress) getTemplate(rt templateType, meta *networkPolicyMetadata, generated string) *[]string {
+func (pr *policyRuleEgress) getTemplate(rt templateType, meta *networkPolicyMetadata, generated string) []string {
 	return getTemplate(rt, meta, generated, 1)
 }
 
-func (prl *networkPolicyListType) processPolicyRules(policy *networkPolicyInfo, policyRule policyRuleType, ipSetHandler *netutils.IPSet,
-	activePolicyChains, activePolicyIpSets *activeRecordSets, ipm *netutils.IpTablesManager) (err error) {
+func (prl *networkPolicyListType) processPolicyRules(policy *networkPolicyInfo, policyRule policyRuleType, ipSetHandler *hostnet.IPSet,
+	activePolicyChains, activePolicyIpSets *activeRecordSet, preparedIpSets *preparedIpSetsType, ipm *hostnet.IpTablesManager) (err error) {
 
 	if policy.targetPods.Size() == 0 {
 		return
 	}
 
-	rules := &netutils.IpTablesRuleListType{}
-	for _, rule := range prl.rules {
-		if err = rule.buildFwRules(policy.meta, policyRule, ipSetHandler, activePolicyIpSets, rules); err != nil {
+	rules := &hostnet.IpTablesRuleListType{}
+	for i, rule := range prl.rules {
+		if err = rule.buildFwRules(policy.meta, policyRule, ipSetHandler, activePolicyIpSets, rules, preparedIpSets, i); err != nil {
 			return
 		}
 	}
 
-	if rules.Size() == 0 {
+	if rules.Size() == 0 || len(policy.targetPods.podsProtocols) == 0 {
 		return
 	}
 
 	chainName := kubeNetworkPolicyChainPrefix.Get(policy.meta.namespace, policy.meta.name, policyRule.String())
 	activePolicyChains.Add(chainName)
-	data.rules += len(*rules) * len(policy.targetPods.podsProtocols)
+	metricsData.rules += len(*rules) * len(policy.targetPods.podsProtocols)
 
-	policy.targetPods.podsProtocols.ForEachCreateRulesWithChain(ipm, "filter", chainName, netutils.IPTABLES_FULL_CHAIN_SYNC_NO_ORDER,
-		netutils.NoReferencedChains, true, rules)
+	hostnet.UsedTcpProtocols.ForEachCreateRulesWithChain(ipm, "filter", chainName, hostnet.IPTABLES_FULL_CHAIN_SYNC_NO_ORDER,
+		true, rules)
 	return
 }
 
-func (pr *networkPolicyType) buildFwRules(meta *networkPolicyMetadata, policyRule policyRuleType, ipset *netutils.IPSet,
-	activePolicyIpSets *activeRecordSets, rules *netutils.IpTablesRuleListType) (err error) {
+func (pr *networkPolicyType) buildFwRules(meta *networkPolicyMetadata, policyRule policyRuleType, ipset *hostnet.IPSet,
+	activePolicyIpSets *activeRecordSet, rules *hostnet.IpTablesRuleListType, preparedIpSets *preparedIpSetsType, i int) (err error) {
 
 	if pr.MatchAllPeers() {
 		// case where only 'ports' details specified but no 'from' details in the ingress rule
 		// so match on all sources, with specified port (if any) and protocol
-		template := policyRule.getTemplate(RULE_TEMPLATE_MATCHALLPEERS, meta, "")
-		pr.asIpTablesRule(rules, *template...)
+		pr.asIpTablesRule(rules, policyRule.getTemplate(RULE_TEMPLATE_MATCHALLPEERS, meta, "")...)
 
 	} else if pr.HasPods() {
 
-		podIpSetName := kubeIpTargetIpSetPrefix.Get(meta.namespace, meta.name, policyRule.String())
+		podIpSetName := kubeIpTargetIpSetPrefix.Get(meta.namespace, meta.name, policyRule, i)
 		if !activePolicyIpSets.Contains(podIpSetName) {
-			_, err = ipset.Create(podIpSetName, netutils.TypeHashIP, netutils.OptionTimeout, "0")
+			/**/
+			_, err = ipset.GetOrCreate(podIpSetName, hostnet.TypeHashIP, hostnet.OptionTimeout, "0")
 			if err != nil {
 				return fmt.Errorf("failed to create ipset: %s", err.Error())
 			}
@@ -566,59 +590,60 @@ func (pr *networkPolicyType) buildFwRules(meta *networkPolicyMetadata, policyRul
 			ingressRuleSrcPodIps = append(ingressRuleSrcPodIps, pod.ip...)
 		})
 
-		ipset.Get(podIpSetName).RefreshAsync(ingressRuleSrcPodIps, netutils.OptionTimeout, "0")
+		//ipset.Get(podIpSetName).RefreshAsync(ingressRuleSrcPodIps, netutils.OptionTimeout, "0")
+		(*preparedIpSets)[podIpSetName] = ipset.Get(podIpSetName).Prepare(ingressRuleSrcPodIps)
 
-		template := policyRule.getTemplate(RULE_TEMPLATE_POD, meta, podIpSetName)
-		pr.asIpTablesRule(rules, *template...)
+		pr.asIpTablesRule(rules, policyRule.getTemplate(RULE_TEMPLATE_POD, meta, podIpSetName)...)
 
 	} else if pr.HasIpBlocks() {
 
-		blockIpSetName := kubeNetTargetIpSetPrefix.Get(meta.namespace, meta.name, policyRule.String())
+		blockIpSetName := kubeNetTargetIpSetPrefix.Get(meta.namespace, meta.name, policyRule, i)
 		if !activePolicyIpSets.Contains(blockIpSetName) {
-			_, err := ipset.Create(blockIpSetName, netutils.TypeHashNet, netutils.OptionTimeout, "0")
+			/**/
+			_, err := ipset.GetOrCreate(blockIpSetName, hostnet.TypeHashNet, hostnet.OptionTimeout, "0")
 			if err != nil {
 				return fmt.Errorf("failed to create ipset: %s", err.Error())
 			}
 			activePolicyIpSets.Add(blockIpSetName)
 		}
 
-		ipset.Get(blockIpSetName).RefreshAsync([][]string(*pr.GetIPBlocks()))
+		//ipset.Get(blockIpSetName).RefreshAsync([][]string(*pr.GetIPBlocks()))
+		(*preparedIpSets)[blockIpSetName] = ipset.Get(blockIpSetName).Prepare([][]string(*pr.GetIPBlocks()))
 
-		template := policyRule.getTemplate(RULE_TEMPLATE_IPBLOCK, meta, blockIpSetName)
-		pr.asIpTablesRule(rules, *template...)
+		pr.asIpTablesRule(rules, policyRule.getTemplate(RULE_TEMPLATE_IPBLOCK, meta, blockIpSetName)...)
 	}
 
 	return
 }
 
-func (npc *NetworkPolicyController) syncPodFirewallChains(activeChains *activeRecordSets, inputPolicy ...*networkPolicyInfoListType) (*activeRecordSets, *activeRecordSets, error) {
+func (npc *NetworkPolicyController) syncPodFirewallChains(activeChains *activeRecordSet, inputPolicy ...networkPolicyInfoListType) (*activeRecordSet, *activeRecordSet, error) {
 	start := time.Now()
 	defer func() {
 		endTime := time.Since(start)
-		glog.V(0).Infof("Syncing syncPodFirewallChains policy chains took %v", endTime)
+		glog.Infof("Syncing syncPodFirewallChains policy chains took %v", endTime)
 	}()
 
-	activePodInChains := activeRecordSets{}.New()
-	activePodOutChains := activeRecordSets{}.New()
+	activePodInChains := npc.activeRecordSetPool.Get().(*activeRecordSet)
+	activePodOutChains := npc.activeRecordSetPool.Get().(*activeRecordSet)
 
-	podsProtocols := &netutils.ProtocolMapType{}
+	podsProtocols := &hostnet.ProtocolMapType{}
 
-	forward := netutils.NewRuleList()
-	output := netutils.NewRuleList()
-	input := netutils.NewRuleList()
-	podOwnChain := netutils.ChainToRuleListMapType{}
+	forward := hostnet.NewRuleList()
+	output := hostnet.NewRuleList()
+	input := hostnet.NewRuleList()
+	podOwnChain := hostnet.ChainToRuleListMapType{}
 
 	nodeProcessed := make(map[uint64]PolicyType)
 
 	workerSet := npc.networkPoliciesInfo
-	ipTablesAction := netutils.IPTABLES_FULL_CHAIN_SYNC_NO_ORDER
+	ipTablesAction := hostnet.IPTABLES_FULL_CHAIN_SYNC_NO_ORDER
 	if len(inputPolicy) != 0 {
 		workerSet = inputPolicy[0]
-		ipTablesAction = netutils.IPTABLES_APPEND_UNIQUE
+		ipTablesAction = hostnet.IPTABLES_APPEND_UNIQUE
 	}
 
 	// loop through the pods running on the node which to which ingress network policies to be applied
-	for _, pol := range *workerSet {
+	for _, pol := range workerSet {
 
 		if !pol.policyType.CheckFor(NETWORK_POLICY_INGRESS) || nodeProcessed[pol.meta.hash].CheckFor(NETWORK_POLICY_INGRESS) {
 			continue
@@ -632,32 +657,32 @@ func (npc *NetworkPolicyController) syncPodFirewallChains(activeChains *activeRe
 		activePodInChains.Add(podFwChainName)
 
 		if podOwnChain[podFwChainName] == nil {
-			podOwnChain[podFwChainName] = netutils.NewRuleList()
+			podOwnChain[podFwChainName] = hostnet.NewRuleList()
 		}
 
 		// ensure statefull firewall, that permits return traffic for the traffic originated by the pod
 		comment := "rule for stateful firewall for PODs selector:" + pol.meta.labels.String() + " namespace: " + pol.meta.namespace
 		args := []string{"-m", "comment", "--comment", comment, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"}
-		podOwnChain[podFwChainName].Add(netutils.NewRuleWithOrder(args...))
+		podOwnChain[podFwChainName].Add(hostnet.NewRuleWithOrder(args...))
 
 		// icmp
 		comment = "rule for icmp for PODs selector:" + pol.meta.labels.String() + " namespace: " + pol.meta.namespace
 		args = []string{"-m", "comment", "--comment", comment, "-m", "set", "--match-set", kubeICMPIpSet, "src", "-j", "ACCEPT"}
-		podOwnChain[podFwChainName].Add(netutils.NewRuleWithOrder(args...))
+		podOwnChain[podFwChainName].Add(hostnet.NewRuleWithOrder(args...))
 
 		// enable cluster nodes to create IPIP tunnels to pods (Dsr), or coming via tun+ interface in case
 		// overlay tunnels are active
 		for proto := range pol.targetPods.podsProtocols {
-			tunnelProto := netutils.NewIP(proto).ProtocolCmdParam().TunnelProto
+			tunnelProto := hostnet.NewIP(proto).ProtocolCmdParam().TunnelProto
 			comment = "rule to permit ipip tunnels for FWMark services from cluster nodes"
 			args = []string{"-m", "comment", "--comment", comment, "-m", "set", "--match-set", kubeNodesIpSet, "src", "-p", tunnelProto, "-j", "ACCEPT"}
-			podOwnChain[podFwChainName].Add(netutils.NewRule(args...))
+			podOwnChain[podFwChainName].Add(hostnet.NewRule(args...))
 			args = []string{"-m", "comment", "--comment", comment, "-i", "tun+", "-p", tunnelProto, "-j", "ACCEPT"}
-			podOwnChain[podFwChainName].Add(netutils.NewRule(args...))
+			podOwnChain[podFwChainName].Add(hostnet.NewRule(args...))
 		}
 
 		// add entries in pod firewall to run through required network policies
-		for _, policy := range *npc.networkPoliciesInfo {
+		for _, policy := range npc.networkPoliciesInfo {
 			if pol.meta.hash == policy.meta.hash && policy.policyType.CheckFor(NETWORK_POLICY_INGRESS) {
 				comment := "run through nw policy " + policy.meta.name + " " + policyRuleIngress{}.String()
 				policyChainName := kubeNetworkPolicyChainPrefix.Get(policy.meta.namespace, policy.meta.name, policyRuleIngress{}.String())
@@ -666,13 +691,13 @@ func (npc *NetworkPolicyController) syncPodFirewallChains(activeChains *activeRe
 				}
 				podsProtocols.Merge(&policy.targetPods.podsProtocols)
 				args := []string{"-m", "comment", "--comment", comment, "-j", policyChainName}
-				podOwnChain[podFwChainName].Add(netutils.NewRule(args...))
+				podOwnChain[podFwChainName].Add(hostnet.NewRule(args...))
 			}
 		}
 
 		comment = "rule to permit the traffic to pods when source is the pod's local node"
 		args = []string{"-m", "comment", "--comment", comment, "-m", "addrtype", "--src-type", "LOCAL", "-j", "ACCEPT"}
-		podOwnChain[podFwChainName].Add(netutils.NewRule(args...))
+		podOwnChain[podFwChainName].Add(hostnet.NewRule(args...))
 
 		// ensure there is rule in filter table and FORWARD chain to jump to pod specific firewall chain
 		// this rule applies to the traffic getting routed (coming for other node pods)
@@ -681,12 +706,12 @@ func (npc *NetworkPolicyController) syncPodFirewallChains(activeChains *activeRe
 		args = []string{"-m", "comment", "--comment", comment,
 			"-m", "set", "--match-set", kubeTargetIpSetPrefix.GetFromMeta(pol.meta), "dst",
 			"-j", podFwChainName}
-		forward.Add(netutils.NewRule(args...))
+		forward.Add(hostnet.NewRule(args...))
 
 		// ensure there is rule in filter table and OUTPUT chain to jump to pod specific firewall chain
 		// this rule applies to the traffic from a pod getting routed back to another pod on same node by service proxy
-		output.Add(netutils.NewRule(args...))
-		input.Add(netutils.NewRule(args...))
+		output.Add(hostnet.NewRule(args...))
+		input.Add(hostnet.NewRule(args...))
 
 		// ensure there is rule in filter table and forward chain to jump to pod specific firewall chain
 		// this rule applies to the traffic getting switched (coming for same node pods)
@@ -696,18 +721,20 @@ func (npc *NetworkPolicyController) syncPodFirewallChains(activeChains *activeRe
 			"-m", "comment", "--comment", comment,
 			"-m", "set", "--match-set", kubeTargetIpSetPrefix.GetFromMeta(pol.meta), "dst",
 			"-j", podFwChainName}
-		forward.Add(netutils.NewRule(args...))
+		forward.Add(hostnet.NewRule(args...))
 
 		// add default DROP rule at the end of chain
-		comment = "default rule to REJECT traffic from PODs selector: " + pol.meta.labels.String() + " namespace: " + pol.meta.namespace
-		args = []string{"-m", "comment", "--comment", comment,
-			"-m", "set", "--match-set", kubeTargetIpSetPrefix.GetFromMeta(pol.meta), "dst",
-			"-j", "REJECT"}
-		podOwnChain[podFwChainName].Add(netutils.NewRule(args...))
+		for _, target := range npc.rejectTargets {
+			comment = "default rule to " + target + " traffic from PODs selector: " + pol.meta.labels.String() + " namespace: " + pol.meta.namespace
+			args = []string{"-m", "comment", "--comment", comment,
+				"-m", "set", "--match-set", kubeTargetIpSetPrefix.GetFromMeta(pol.meta), "dst",
+				"-j", target}
+			podOwnChain[podFwChainName].Add(hostnet.NewRule(args...))
+		}
 	}
 
 	// loop through the pods running on the node which egress network policies to be applied
-	for _, pol := range *workerSet {
+	for _, pol := range workerSet {
 
 		if !pol.policyType.CheckFor(NETWORK_POLICY_EGRESS) || nodeProcessed[pol.meta.hash].CheckFor(NETWORK_POLICY_EGRESS) {
 			continue
@@ -721,16 +748,16 @@ func (npc *NetworkPolicyController) syncPodFirewallChains(activeChains *activeRe
 		activePodOutChains.Add(podFwChainName)
 
 		if podOwnChain[podFwChainName] == nil {
-			podOwnChain[podFwChainName] = netutils.NewRuleList()
+			podOwnChain[podFwChainName] = hostnet.NewRuleList()
 		}
 
 		// ensure statefull firewall, that permits return traffic for the traffic originated by the pod
 		comment := "rule for stateful firewall for PODs selector:" + pol.meta.labels.String() + " namespace: " + pol.meta.namespace
 		args := []string{"-m", "comment", "--comment", comment, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"}
-		podOwnChain[podFwChainName].Add(netutils.NewRuleWithOrder(args...))
+		podOwnChain[podFwChainName].Add(hostnet.NewRuleWithOrder(args...))
 
 		// add entries in pod firewall to run through required network policies
-		for _, policy := range *npc.networkPoliciesInfo {
+		for _, policy := range npc.networkPoliciesInfo {
 			if pol.meta.hash == policy.meta.hash && policy.policyType.CheckFor(NETWORK_POLICY_EGRESS) {
 				comment := "run through nw policy " + policy.meta.name + " " + policyRuleEgress{}.String()
 				policyChainName := kubeNetworkPolicyChainPrefix.Get(policy.meta.namespace, policy.meta.name, policyRuleEgress{}.String())
@@ -739,7 +766,7 @@ func (npc *NetworkPolicyController) syncPodFirewallChains(activeChains *activeRe
 				}
 				podsProtocols.Merge(&policy.targetPods.podsProtocols)
 				args = []string{"-m", "comment", "--comment", comment, "-j", policyChainName}
-				podOwnChain[podFwChainName].Add(netutils.NewRule(args...))
+				podOwnChain[podFwChainName].Add(hostnet.NewRule(args...))
 			}
 		}
 
@@ -750,7 +777,7 @@ func (npc *NetworkPolicyController) syncPodFirewallChains(activeChains *activeRe
 		args = []string{"-m", "comment", "--comment", comment,
 			"-m", "set", "--match-set", kubeTargetIpSetPrefix.GetFromMeta(pol.meta), "src",
 			"-j", podFwChainName}
-		forward.Add(netutils.NewRule(args...))
+		forward.Add(hostnet.NewRule(args...))
 
 		// ensure there is rule in filter table and forward chain to jump to pod specific firewall chain
 		// this rule applies to the traffic getting switched (coming for same node pods)
@@ -760,82 +787,78 @@ func (npc *NetworkPolicyController) syncPodFirewallChains(activeChains *activeRe
 			"-m", "comment", "--comment", comment,
 			"-m", "set", "--match-set", kubeTargetIpSetPrefix.GetFromMeta(pol.meta), "src",
 			"-j", podFwChainName}
-		forward.Add(netutils.NewRule(args...))
+		forward.Add(hostnet.NewRule(args...))
 
 		// add default DROP rule at the end of chain
-		comment = "default rule to REJECT traffic from PODs selector: " + pol.meta.labels.String() + " namespace: " + pol.meta.namespace
-		args = []string{"-m", "comment", "--comment", comment,
-			"-m", "set", "--match-set", kubeTargetIpSetPrefix.GetFromMeta(pol.meta), "src",
-			"-j", "REJECT"}
-		podOwnChain[podFwChainName].Add(netutils.NewRule(args...))
+		for _, target := range npc.rejectTargets {
+			comment = "default rule to " + target + " traffic from PODs selector: " + pol.meta.labels.String() + " namespace: " + pol.meta.namespace
+			args = []string{"-m", "comment", "--comment", comment,
+				"-m", "set", "--match-set", kubeTargetIpSetPrefix.GetFromMeta(pol.meta), "src",
+				"-j", target}
+			podOwnChain[podFwChainName].Add(hostnet.NewRule(args...))
+		}
 	}
 
-	if err, rules := podsProtocols.ForEachCreateRulesWithChain(npc.Ipm, "filter", "", netutils.IPTABLES_FULL_CHAIN_SYNC_NO_ORDER,
-		netutils.NoReferencedChains, true, podOwnChain); err != nil {
+	if err, rules := podsProtocols.ForEachCreateRulesWithChain(npc.Ipm, "filter", "", hostnet.IPTABLES_FULL_CHAIN_SYNC_NO_ORDER,
+		true, podOwnChain); err != nil {
 		return activePodInChains, activePodOutChains, err
 	} else {
-		data.rules += rules
+		metricsData.rules += rules
 	}
 
 	if err, _ := podsProtocols.ForEachCreateRulesWithChain(
 		npc.Ipm, "filter", string(kubeOutputPreprocessChain),
-		ipTablesAction, []string{"OUTPUT"}, true, output); err != nil {
+		ipTablesAction, true, output, hostnet.ReferenceFromType{In: "OUTPUT", Pos: 1}); err != nil {
 
 		return activePodInChains, activePodOutChains, err
 	}
-	data.rules += output.Size() * len(*podsProtocols)
+	metricsData.rules += output.Size() * len(*podsProtocols)
 
 	if err, _ := podsProtocols.ForEachCreateRulesWithChain(
 		npc.Ipm, "filter", string(kubeInputPreprocessChain),
-		ipTablesAction, []string{"INPUT"}, true, input); err != nil {
+		ipTablesAction, true, input, hostnet.ReferenceFromType{In: "INPUT", Pos: 1}); err != nil {
 
 		return activePodInChains, activePodOutChains, err
 	}
-	data.rules += input.Size() * len(*podsProtocols)
+	metricsData.rules += input.Size() * len(*podsProtocols)
 
 	if err, _ := podsProtocols.ForEachCreateRulesWithChain(
 		npc.Ipm, "filter", string(kubeForwardPreprocessChain),
-		ipTablesAction, []string{netutils.CHAIN_KUBE_COMMON_FORWARD},
-		true, forward); err != nil {
+		ipTablesAction, true, forward, hostnet.ReferenceFromType{In: hostnet.CHAIN_KUBE_COMMON_FORWARD}); err != nil {
 
 		return activePodInChains, activePodOutChains, err
 	}
-	data.rules += forward.Size() * len(*podsProtocols)
+	metricsData.rules += forward.Size() * len(*podsProtocols)
 	return activePodInChains, activePodOutChains, nil
 }
 
-func (ma *activeRecordSets) contains(a, b string) bool {
-	return !ma.at[a] && !ma.at[b]
+func (ma *activeRecordSet) contains(a, b string) bool {
+	return !ma.activeRecordMapType[a] && !ma.activeRecordMapType[b]
 }
 
 func (npc *NetworkPolicyController) cleanupObsoleteResources(ipsets, chains []string) {
 	for _, chainPrefix := range chains {
-		npc.cleanupChains(chainPrefix, cmp.Comparer((&activeRecordSets{}).contains))
+		npc.cleanupChains(chainPrefix, cmp.Comparer((&activeRecordSet{}).contains))
 	}
-	npc.cleanupIpSets(&activeRecordSets{}, ipsets)
+	npc.cleanupIpSets(&activeRecordSet{}, ipsets)
 }
 
 func (npc *NetworkPolicyController) cleanupChains(chainPrefix string, comparer cmp.Option) {
-	start := time.Now()
-	defer func() {
-		endTime := time.Since(start)
-		glog.V(0).Infof("Syncing cleanupChains policy chains for prefix %s took %v", chainPrefix, endTime)
-	}()
-
-	netutils.UsedTcpProtocols.ForEach(func(proto netutils.Proto) error {
+	hostnet.UsedTcpProtocols.ForEach(func(proto hostnet.Proto) error {
 		return npc.Ipm.IptablesCleanUpChainWithComparer(proto, chainPrefix, true,
-			cmp.FilterValues(utils.SymetricHasPrefix, comparer), "filter")
+			cmp.FilterValues(tools.SymmetricHasPrefix, comparer), "filter")
 	})
 }
 
-func (npc *NetworkPolicyController) cleanupIpSets(activePolicyIPSets *activeRecordSets, prefixToClean []string) error {
+func (npc *NetworkPolicyController) cleanupIpSets(activePolicyIPSets *activeRecordSet, prefixToClean []string) error {
 	start := time.Now()
-	defer func() {
-		endTime := time.Since(start)
-		glog.V(0).Infof("Syncing cleanupIpSets policy chains took %v", endTime)
-	}()
+	defer glog.Infof("CleanupIpSets policy chains took %v", time.Since(start))
 
-	setsToClean, err := netutils.NewIPSet().SaveSimpleList()
+	if npc.cfgCheck.GetForceNextRun(npc) {
+		return nil
+	}
+
+	setsToClean, err := hostnet.NewIPSet().SaveSimpleList()
 	if err != nil {
 		glog.Errorf("failed to get IPSet data for cleanup due to %s", err.Error())
 	}
@@ -854,23 +877,21 @@ func (npc *NetworkPolicyController) cleanupIpSets(activePolicyIPSets *activeReco
 		}
 
 		name := set.Name
-		if strings.HasSuffix(name, netutils.TmpTableSuffix) {
+		if strings.HasSuffix(name, hostnet.TmpTableSuffix) {
 			name = name[:len(name)-1]
 		}
 		if !activePolicyIPSets.Contains(name) {
-			set.DestroyAsync()
+			npc.ipSetHandler.Destroy(name)
 		}
 	}
 	return nil
 }
 
 func (npc *NetworkPolicyController) cleanupStaleRules(activePolicyChains, activePodInChains,
-	activePodOutChains, activePolicyIPSets *activeRecordSets) error {
+	activePodOutChains, activePolicyIPSets *activeRecordSet) error {
+
 	start := time.Now()
-	defer func() {
-		endTime := time.Since(start)
-		glog.V(0).Infof("Syncing cleanupStaleRules policy chains took %v", endTime)
-	}()
+	defer glog.Infof("Syncing cleanupStaleRules policy chains took %v", time.Since(start))
 
 	npc.cleanupChains(kubeNetworkPolicyChainPrefix.String(), cmp.Comparer(activePolicyChains.contains))
 
@@ -878,6 +899,11 @@ func (npc *NetworkPolicyController) cleanupStaleRules(activePolicyChains, active
 	npc.cleanupChains(kubePodOutChainPrefix.String(), cmp.Comparer(activePodOutChains.contains))
 
 	npc.cleanupIpSets(activePolicyIPSets, []string{"KUBE-TGT"})
+
+	npc.activeRecordSetPool.Put(activePolicyChains.Reset())
+	npc.activeRecordSetPool.Put(activePodInChains.Reset())
+	npc.activeRecordSetPool.Put(activePodOutChains.Reset())
+	npc.activeRecordSetPool.Put(activePolicyIPSets.Reset())
 	return nil
 }
 
@@ -890,14 +916,11 @@ func (pr *networkPolicyType) checkForNamedPorts(ports *[]networking.NetworkPolic
 	return nil
 }
 
-func (npc *NetworkPolicyController) buildNetworkPoliciesInfo() (*networkPolicyInfoListType, error) {
+func (npc *NetworkPolicyController) buildNetworkPoliciesInfo() (networkPolicyInfoListType, error) {
 	start := time.Now()
-	defer func() {
-		endTime := time.Since(start)
-		glog.V(0).Infof("Syncing buildNetworkPoliciesInfo policy chains took %v", endTime)
-	}()
+	defer glog.Infof("Syncing buildNetworkPoliciesInfo policy chains took %v", time.Since(start))
 
-	NetworkPolicies := &networkPolicyInfoListType{}
+	NetworkPolicies := make(networkPolicyInfoListType)
 
 	for _, policyObj := range npc.npLister.List() {
 
@@ -919,7 +942,7 @@ func (npc *NetworkPolicyController) buildSinglePolicyInfo(policy *networking.Net
 			name:      policy.Name,
 			namespace: policy.Namespace,
 			labels:    policy.Spec.PodSelector.MatchLabels,
-			hash:      utils.DoHash64(policy.Namespace + labels.FormatLabels(policy.Spec.PodSelector.MatchLabels)),
+			hash:      tools.GetHash64(policy.Namespace + labels.FormatLabels(policy.Spec.PodSelector.MatchLabels)),
 			source:    policy,
 		},
 	}
@@ -957,9 +980,9 @@ func (pol *networkPolicyInfo) decodePolicyType(policy *networking.NetworkPolicy)
 type EvalPodPeer func(*networking.NetworkPolicy, *networking.NetworkPolicyPeer) *podListType
 
 func (npc *NetworkPolicyController) evalPodPeer(policy *networking.NetworkPolicy, peer *networking.NetworkPolicyPeer) *podListType {
-	var namespaces = []*api.Namespace{{ObjectMeta: v1.ObjectMeta{Name: policy.Namespace}}}
+	var namespaces = []*k8sapi.Namespace{{ObjectMeta: v1.ObjectMeta{Name: policy.Namespace}}}
 	var podSelectorLabels = labels.Everything()
-	var matchingPods = podListType{podsProtocols: netutils.ProtocolMapType{}, pods: &podListMapType{}}
+	var matchingPods = podListType{podsProtocols: hostnet.ProtocolMapType{}, pods: &podListMapType{}}
 
 	if peer.NamespaceSelector == nil && peer.PodSelector == nil {
 		return nil
@@ -981,26 +1004,27 @@ func (npc *NetworkPolicyController) evalPodPeer(policy *networking.NetworkPolicy
 }
 
 func (npc *NetworkPolicyController) ListPodInfoByNamespaceAndLabels(namespace string, selector labels.Selector) *podListType {
-	matchingPods := podListType{podsProtocols: netutils.ProtocolMapType{}, portNameToPort: &nameToPortType{}, pods: &podListMapType{}}
+	matchingPods := podListType{podsProtocols: hostnet.ProtocolMapType{}, portNameToPort: &nameToPortType{}, pods: &podListMapType{}}
 	for _, namespacePod := range npc.ListPodsByNamespaceAndLabels(namespace, selector) {
-		if namespacePod.Status.PodIP != "" {
-			podInfo := podInfo{}.fromApi(namespacePod)
-			matchingPods.Add(podInfo)
+		podInfo := podInfo{}.fromApi(namespacePod)
+		matchingPods.Add(podInfo)
 
-			matchingPods.podsProtocols[netutils.NewIP(namespacePod.Status.PodIP).Protocol()] = true
-			if !matchingPods.hasPodsLocally && npc.nodeIP.Equal(netutils.NewIP(namespacePod.Status.HostIP).ToIP()) {
-				matchingPods.hasPodsLocally = true
-			}
+		npc.getPortNameToPortMap(matchingPods.portNameToPort, namespacePod)
 
-			podInfo.ip = append(podInfo.ip, netutils.NewList(npc.getExternalIP(podInfo.ip[0].IP, namespace))...)
-
-			npc.getPortNameToPortMap(matchingPods.portNameToPort, namespacePod)
+		if namespacePod.Status.PodIP == "" {
+			continue
 		}
+
+		matchingPods.podsProtocols[hostnet.NewIP(namespacePod.Status.PodIP).Protocol()] = true
+		if !matchingPods.hasPodsLocally && npc.GetNodeIP().IP.Equal(hostnet.NewIP(namespacePod.Status.HostIP).ToIP()) {
+			matchingPods.hasPodsLocally = true
+		}
+		podInfo.AppendIPs(hostnet.NewIPNetList(npc.getExternalIP(labels.Set(namespacePod.Labels), namespace))...)
 	}
 	return &matchingPods
 }
 
-func (npc *NetworkPolicyController) getPortNameToPortMap(out *nameToPortType, pod *api.Pod) {
+func (npc *NetworkPolicyController) getPortNameToPortMap(out *nameToPortType, pod *k8sapi.Pod) {
 	for _, container := range pod.Spec.Containers {
 		for _, port := range container.Ports {
 			(*out)[port.Name] = port.ContainerPort
@@ -1008,7 +1032,7 @@ func (npc *NetworkPolicyController) getPortNameToPortMap(out *nameToPortType, po
 	}
 }
 
-func (npc *NetworkPolicyController) ListPodsByNamespaceAndLabels(namespace string, selector labels.Selector) (ret []*api.Pod) {
+func (npc *NetworkPolicyController) ListPodsByNamespaceAndLabels(namespace string, selector labels.Selector) (ret []*k8sapi.Pod) {
 	allMatchedNameSpacePods, err := listers.NewPodLister(npc.podLister).Pods(namespace).List(selector)
 	if err != nil {
 		glog.Error("Failed to build network policies info due to " + err.Error())
@@ -1017,7 +1041,7 @@ func (npc *NetworkPolicyController) ListPodsByNamespaceAndLabels(namespace strin
 	return allMatchedNameSpacePods
 }
 
-func (npc *NetworkPolicyController) ListNamespaceByLabels(selector labels.Selector) []*api.Namespace {
+func (npc *NetworkPolicyController) ListNamespaceByLabels(selector labels.Selector) []*k8sapi.Namespace {
 	matchedNamespaces, err := listers.NewNamespaceLister(npc.nsLister).List(selector)
 	if err != nil {
 		glog.Error("Failed to build network policies info due to " + err.Error())
@@ -1031,9 +1055,9 @@ func evalIPBlockPeer(peer *networking.NetworkPolicyPeer) (ipBlock [][]string) {
 		return
 	}
 
-	ipBlock = append(ipBlock, append(parseCIDR(peer.IPBlock.CIDR, netutils.OptionTimeout, "0"))...)
+	ipBlock = append(ipBlock, append(parseCIDR(peer.IPBlock.CIDR, hostnet.OptionTimeout, "0"))...)
 	for _, except := range peer.IPBlock.Except {
-		ipBlock = append(ipBlock, append(parseCIDR(except, netutils.OptionTimeout, "0", netutils.OptionNoMatch))...)
+		ipBlock = append(ipBlock, append(parseCIDR(except, hostnet.OptionTimeout, "0", hostnet.OptionNoMatch))...)
 	}
 
 	return
@@ -1041,7 +1065,7 @@ func evalIPBlockPeer(peer *networking.NetworkPolicyPeer) (ipBlock [][]string) {
 
 func parseCIDR(cidr string, options ...string) [][]string {
 	if strings.HasSuffix(cidr, "/0") {
-		if netutils.NewIP(cidr).IsIPv4() {
+		if hostnet.NewIP(cidr).IsIPv4() {
 			return [][]string{append([]string{"0.0.0.0/1"}, options...), append([]string{"128.0.0.0/1"}, options...)}
 		} else {
 			return [][]string{append([]string{"::/1"}, options...), append([]string{"8000::/1"}, options...)}
@@ -1050,9 +1074,9 @@ func parseCIDR(cidr string, options ...string) [][]string {
 	return [][]string{append([]string{cidr}, options...)}
 }
 
-func (npc *NetworkPolicyController) buildBetaNetworkPoliciesInfo() (*networkPolicyInfoListType, error) {
+func (npc *NetworkPolicyController) buildBetaNetworkPoliciesInfo() (networkPolicyInfoListType, error) {
 
-	NetworkPolicies := make(networkPolicyInfoListType, 0)
+	NetworkPolicies := make(networkPolicyInfoListType)
 
 	for _, policyObj := range npc.npLister.List() {
 
@@ -1063,7 +1087,7 @@ func (npc *NetworkPolicyController) buildBetaNetworkPoliciesInfo() (*networkPoli
 				name:      policy.Name,
 				namespace: policy.Namespace,
 				labels:    policy.Spec.PodSelector.MatchLabels,
-				hash:      utils.DoHash64(policy.Namespace + labels.FormatLabels(policy.Spec.PodSelector.MatchLabels)),
+				hash:      tools.GetHash64(policy.Namespace + labels.FormatLabels(policy.Spec.PodSelector.MatchLabels)),
 			},
 		}
 
@@ -1074,7 +1098,7 @@ func (npc *NetworkPolicyController) buildBetaNetworkPoliciesInfo() (*networkPoli
 
 			for _, port := range specIngressRule.Ports {
 				protocolAndPort := newProtocolAndPort(&networking.NetworkPolicyPort{port.Protocol, port.Port})
-				ingressRule.GetPorts().Add(protocolAndPort)
+				ingressRule.AddPorts(protocolAndPort)
 			}
 
 			for _, peer := range specIngressRule.From {
@@ -1085,7 +1109,7 @@ func (npc *NetworkPolicyController) buildBetaNetworkPoliciesInfo() (*networkPoli
 		NetworkPolicies.Add(newPolicy)
 	}
 
-	return &NetworkPolicies, nil
+	return NetworkPolicies, nil
 }
 
 func (p kubePolPrefixType) String() string {
@@ -1097,7 +1121,7 @@ func (p kubePolPrefixType) GetFromMeta(meta *networkPolicyMetadata) string {
 }
 
 func (p kubePolPrefixType) Get(i ...interface{}) string {
-	return p.getInternal(utils.DoHash64(fmt.Sprint(i...)))
+	return p.getInternal(tools.GetHash64(fmt.Sprint(i...)))
 }
 
 func (p kubePolPrefixType) getInternal(hash uint64) string {
@@ -1109,16 +1133,16 @@ func (npc *NetworkPolicyController) Cleanup() {
 
 	glog.Info("Cleaning up iptables configuration permanently done by kube-router")
 
-	for p := range netutils.UsedTcpProtocols {
-		npc.Ipm.IptablesCleanUpChainWithComparer(p, kubePodInChainPrefix.String(), true, cmp.Comparer(utils.SymetricHasPrefix))
-		npc.Ipm.IptablesCleanUpChainWithComparer(p, kubePodOutChainPrefix.String(), true, cmp.Comparer(utils.SymetricHasPrefix))
-		npc.Ipm.IptablesCleanUpChainWithComparer(p, kubeNetworkPolicyChainPrefix.String(), true, cmp.Comparer(utils.SymetricHasPrefix))
+	for p := range hostnet.UsedTcpProtocols {
+		npc.Ipm.IptablesCleanUpChainWithComparer(p, kubePodInChainPrefix.String(), true, cmp.Comparer(tools.SymmetricHasPrefix))
+		npc.Ipm.IptablesCleanUpChainWithComparer(p, kubePodOutChainPrefix.String(), true, cmp.Comparer(tools.SymmetricHasPrefix))
+		npc.Ipm.IptablesCleanUpChainWithComparer(p, kubeNetworkPolicyChainPrefix.String(), true, cmp.Comparer(tools.SymmetricHasPrefix))
 	}
 
 	npc.cleanupObsoleteResources([]string{}, kubeCleanupChainPrefix)
 
 	// delete all ipsets
-	ipset := netutils.NewIPSet()
+	ipset := hostnet.NewIPSet()
 
 	err := ipset.Save()
 	if err != nil {
@@ -1138,10 +1162,9 @@ func (npc *NetworkPolicyController) newPodEventHandler() cache.ResourceEventHand
 
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			newPoObj := newObj.(*api.Pod)
-			oldPoObj := oldObj.(*api.Pod)
-			if newPoObj.Status.Phase != api.PodPending &&
-				(newPoObj.Status.Phase != oldPoObj.Status.Phase || newPoObj.Status.PodIP != oldPoObj.Status.PodIP) {
+			newPoObj := newObj.(*k8sapi.Pod)
+			oldPoObj := oldObj.(*k8sapi.Pod)
+			if newPoObj.Status.Phase != oldPoObj.Status.Phase && newPoObj.Status.Phase != k8sapi.PodSucceeded || newPoObj.Status.PodIP != oldPoObj.Status.PodIP {
 				// for the network policies, we are only interested in pod status phase change or IP change
 				npc.OnPodUpdate(newObj)
 			}
@@ -1169,6 +1192,18 @@ func (npc *NetworkPolicyController) newNamespaceEventHandler() cache.ResourceEve
 	}
 }
 
+func (npc *NetworkPolicyController) newNodesEventHandler() cache.ResourceEventHandler {
+	return cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			npc.syncNodesIPSet()
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {},
+		DeleteFunc: func(obj interface{}) {
+			npc.syncNodesIPSet()
+		},
+	}
+}
+
 func (npc *NetworkPolicyController) newNetworkPolicyEventHandler() cache.ResourceEventHandler {
 	return cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
@@ -1184,72 +1219,58 @@ func (npc *NetworkPolicyController) newNetworkPolicyEventHandler() cache.Resourc
 	}
 }
 
-func (npc *NetworkPolicyController) syncNodesIPSet() error {
-	nodes, err := npc.clientset.CoreV1().Nodes().List(v1.ListOptions{})
-	if err != nil {
-		err = errors.New("Failed to list nodes from API server due to: " + err.Error())
-	}
-
+func (npc *NetworkPolicyController) syncNodesIPSet() (err error) {
 	currentNodes := make([]string, 0)
-	if err == nil {
-		for _, node := range nodes.Items {
-			nodeIP, _ := utils.GetNodeIP(&node)
-			currentNodes = append(currentNodes, nodeIP.String())
-		}
+	for _, node := range api.GetAllClusterNodes(npc.nodeLister) {
+		nodeIP := api.GetNodeIP(&node)
+		currentNodes = append(currentNodes, nodeIP.String())
 	}
 
-	if err == nil {
-		if set, errSet := npc.ipSetHandler.GetOrCreate(kubeNodesIpSet, netutils.TypeHashIP, netutils.OptionTimeout, "0"); errSet != nil {
-			err = errors.New("Failed to create ipset " + kubeNodesIpSet)
-		} else {
-			set.RefreshAsync(currentNodes)
-		}
+	if set, errSet := npc.ipSetHandler.GetOrCreate(kubeNodesIpSet, hostnet.TypeHashIP, hostnet.OptionTimeout, "0"); errSet != nil {
+		err = errors.New("Failed to create ipset " + kubeNodesIpSet)
+	} else {
+		set.RefreshAsync(currentNodes)
 	}
+
 	if err != nil {
 		glog.Error(err)
 	}
 	return err
 }
 
-func (npc *NetworkPolicyController) getExternalIP(podIP net.IP, namespace string) (eips []string) {
-	var svc *api.Service
-	obj, exists, err := npc.getSvcFromPodIP(podIP, namespace)
-	svc, ok := obj.(*api.Service)
-	if err != nil {
-		glog.Errorf("error getting externalIPs: %s", err.Error())
-		return
-	} else if !exists || !ok || svc == nil {
-		return
-	}
-
-	eips = svc.Spec.ExternalIPs
-	for _, lbIngress := range svc.Status.LoadBalancer.Ingress {
-		if len(lbIngress.IP) > 0 {
-			eips = append(eips, lbIngress.IP)
-		}
-	}
-
-	return
-}
-
-func (npc *NetworkPolicyController) getSvcFromPodIP(podIP net.IP, namespace string) (item interface{}, exists bool, err error) {
-	for _, obj := range npc.epLister.List() {
-		eps := obj.(*api.Endpoints)
-		for _, ep := range eps.Subsets {
-			for _, addr := range ep.Addresses {
-				if netutils.NewIP(addr.IP).ToIP().Equal(podIP) {
-					return npc.svcLister.GetByKey(eps.Namespace + "/" + eps.Name)
-				}
+func (npc *NetworkPolicyController) getExternalIP(labels labels.Labels, namespace string) (eips []string) {
+	objs, _ := npc.getSvcFromPodLabels(labels, namespace)
+	for _, svc := range objs {
+		eips = append(eips, svc.Spec.ExternalIPs...)
+		for _, lbIngress := range svc.Status.LoadBalancer.Ingress {
+			if len(lbIngress.IP) > 0 {
+				eips = append(eips, lbIngress.IP)
 			}
 		}
 	}
-	return nil, false, nil
+	return
+}
+
+func (npc *NetworkPolicyController) getSvcFromPodLabels(podLabels labels.Labels, namespace string) (item []*k8sapi.Service, err error) {
+	for _, obj := range npc.svcLister.List() {
+		svc := obj.(*k8sapi.Service)
+		if svc.Namespace == namespace && labels.SelectorFromSet(svc.Spec.Selector).Matches(podLabels) {
+			item = append(item, svc)
+		}
+	}
+	return item, nil
 }
 
 // NewNetworkPolicyController returns new NetworkPolicyController object
-func NewNetworkPolicyController(clientset kubernetes.Interface, config *options.KubeRouterConfig,
-	podInformer, npInformer, nsInformer, epInformer, svcInformer cache.SharedIndexInformer) (*NetworkPolicyController, error) {
-	npc := NetworkPolicyController{mu: utils.ControllerSyncLockType{}.New()}
+func NewNetworkPolicyController(config *options.KubeRouterConfig,
+	podInformer, npInformer, nsInformer, epInformer, svcInformer, nodeInformer cache.SharedIndexInformer) controllers.ControllerType {
+	npc := NetworkPolicyController{
+		activeRecordSetPool: &sync.Pool{New: func() interface{} {
+			return &activeRecordSet{activeRecordMapType: make(activeRecordMapType)}
+		}},
+	}
+
+	npc.Init("Policy controller", config.IPTablesSyncPeriod, config, npc.run)
 
 	if config.MetricsEnabled {
 		//GetData the metrics for this controller
@@ -1258,11 +1279,14 @@ func NewNetworkPolicyController(clientset kubernetes.Interface, config *options.
 		npc.MetricsEnabled = true
 	}
 
-	npc.syncPeriod = config.IPTablesSyncPeriod
-	npc.clientset = clientset
+	if config.LogRejects {
+		npc.rejectTargets = []string{"LOG", "REJECT"}
+	} else {
+		npc.rejectTargets = []string{"REJECT"}
+	}
 
 	npc.v1NetworkPolicy = true
-	v, _ := clientset.Discovery().ServerVersion()
+	v, _ := npc.GetConfig().ClientSet.Discovery().ServerVersion()
 	valid := regexp.MustCompile("[0-9]")
 	v.Minor = strings.Join(valid.FindAllString(v.Minor, -1), "")
 	minorVer, _ := strconv.Atoi(v.Minor)
@@ -1270,39 +1294,29 @@ func NewNetworkPolicyController(clientset kubernetes.Interface, config *options.
 		npc.v1NetworkPolicy = false
 	}
 
-	node, err := utils.GetNodeObject(clientset, config.HostnameOverride)
-	if err != nil {
-		return nil, err
-	}
+	npc.Ipm = hostnet.NewIpTablesManager(npc.GetNodeIP().IP)
 
-	npc.nodeHostName = node.Name
-
-	nodeIP, err := utils.GetNodeIP(node)
-	if err != nil {
-		return nil, err
-	}
-	npc.nodeIP = nodeIP
-
-	npc.Ipm = netutils.NewIpTablesManager([]string{npc.nodeIP.String()})
-
-	ipset := netutils.NewIPSet()
-	err = ipset.Save()
-	if err != nil {
-		return nil, err
-	}
-	npc.ipSetHandler = ipset
+	npc.ipSetHandler = hostnet.NewIPSet()
+	npc.ipSetHandler.Save()
 
 	npc.epLister = epInformer.GetIndexer()
 	npc.svcLister = svcInformer.GetIndexer()
 
 	npc.podLister = podInformer.GetIndexer()
 	npc.PodEventHandler = npc.newPodEventHandler()
+	podInformer.AddEventHandler(npc.PodEventHandler)
 
 	npc.nsLister = nsInformer.GetIndexer()
 	npc.NamespaceEventHandler = npc.newNamespaceEventHandler()
+	nsInformer.AddEventHandler(npc.NamespaceEventHandler)
 
 	npc.npLister = npInformer.GetIndexer()
 	npc.NetworkPolicyEventHandler = npc.newNetworkPolicyEventHandler()
+	npInformer.AddEventHandler(npc.NetworkPolicyEventHandler)
 
-	return &npc, nil
+	npc.nodeLister = nodeInformer.GetIndexer()
+	npc.NodesEventHandler = npc.newNodesEventHandler()
+	nodeInformer.AddEventHandler(npc.NodesEventHandler)
+
+	return &npc
 }

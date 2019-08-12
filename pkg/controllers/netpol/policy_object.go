@@ -3,7 +3,7 @@ package netpol
 import (
 	"fmt"
 
-	"github.com/cloudnativelabs/kube-router/pkg/utils/net-tools"
+	"github.com/cloudnativelabs/kube-router/pkg/helpers/hostnet"
 	api "k8s.io/api/core/v1"
 	networking "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -68,7 +68,7 @@ type podListMapType map[infoMapsKeyType]*podInfo
 type nameToPortType map[string]int32
 
 type podListType struct {
-	podsProtocols  netutils.ProtocolMapType
+	podsProtocols  hostnet.ProtocolMapType
 	pods           *podListMapType
 	portNameToPort *nameToPortType
 	hasPodsLocally bool
@@ -104,7 +104,7 @@ type policyRuleOperations interface {
 }
 
 type networkPolicyOperations interface {
-	asIpTablesRule([]string, func() bool, *netutils.IpTablesRuleListType)
+	asIpTablesRule([]string, func() bool, *hostnet.IpTablesRuleListType)
 	parsePolicyPorts([]networking.NetworkPolicyPort, *networking.NetworkPolicy) bool
 	parsePolicyPeers([]networking.NetworkPolicyPeer, *networking.NetworkPolicy, EvalPodPeer) bool
 	parsePolicy(*networking.NetworkPolicy, EvalPodPeer)
@@ -112,7 +112,7 @@ type networkPolicyOperations interface {
 
 type policyRuleType interface {
 	fmt.Stringer
-	getTemplate(templateType, *networkPolicyMetadata, string) *[]string
+	getTemplate(templateType, *networkPolicyMetadata, string) []string
 }
 
 type policyRuleEgress struct {
@@ -131,30 +131,33 @@ type networkPolicyListType struct {
 
 type activeRecordMapType map[string]bool
 
-type activeRecordSets struct {
-	at activeRecordMapType
+type activeRecordSet struct {
+	activeRecordMapType
+	order []string
 }
 
-func (ars activeRecordSets) New() *activeRecordSets {
-	(&ars).at = make(activeRecordMapType)
-	return &ars
+func (ars *activeRecordSet) Reset() *activeRecordSet {
+	ars.activeRecordMapType = make(activeRecordMapType, len(ars.order))
+	ars.order = ars.order[:0]
+	return ars
 }
 
-func (ars *activeRecordSets) Size() int {
-	return len(ars.at)
+func (ars *activeRecordSet) Size() int {
+	return len(ars.activeRecordMapType)
 }
 
-func (ars *activeRecordSets) Add(used string) {
-	ars.at[used] = true
+func (ars *activeRecordSet) Add(used string) {
+	ars.activeRecordMapType[used] = true
+	ars.order = append(ars.order, used)
 }
 
-func (ars *activeRecordSets) Contains(used string) bool {
-	return ars.at[used]
+func (ars *activeRecordSet) Contains(used string) bool {
+	return ars.activeRecordMapType[used]
 }
 
-func (ars *activeRecordSets) ForEach(fn func(args string)) {
-	for rs := range ars.at {
-		fn(rs)
+func (ars *activeRecordSet) ForEach(fn func(string)) {
+	for i := ars.Size(); i > 0; i-- {
+		fn(ars.order[i-1])
 	}
 }
 
@@ -208,7 +211,10 @@ func newProtocolAndPort(port *networking.NetworkPolicyPort) *protocolAndPort {
 }
 
 func (pi podInfo) fromApi(pod *api.Pod) *podInfo {
-	pi.ip = []*net.IPNet{netutils.NewIP(pod.Status.PodIP).ToIPNet()}
+	pi.ip = make([]*net.IPNet, 0)
+	if pod.Status.PodIP != "" {
+		pi.ip = append(pi.ip, hostnet.NewIP(pod.Status.PodIP).ToIPNet())
+	}
 	pi.namespace = pod.Namespace
 	pi.name = pod.Name
 	pi.uid = infoMapsKeyType(pod.UID)
@@ -263,7 +269,7 @@ func (pr *networkPolicyType) parsePolicyPorts(ports []networking.NetworkPolicyPo
 			*port.Port = intstr.FromInt(int((*targetPods.portNameToPort)[port.Port.StrVal]))
 		}
 		protocolAndPort = newProtocolAndPort(&port)
-		pr.GetPorts().Add(protocolAndPort)
+		pr.AddPorts(protocolAndPort)
 	}
 	return
 }
@@ -280,23 +286,24 @@ func (pr *networkPolicyType) parsePolicyPeers(peers []networking.NetworkPolicyPe
 	return
 }
 
-func (pr *networkPolicyType) asIpTablesRule(exportTo *netutils.IpTablesRuleListType, template ...string) {
+func (pr *networkPolicyType) asIpTablesRule(exportTo *hostnet.IpTablesRuleListType, template ...string) {
 
 	if !pr.MatchAllPorts() {
 		// case where 'ports' details and 'from' details specified in the ingress rule
 		for _, portProtocol := range *pr.GetPorts() {
-			exportTo.Add(netutils.NewRule(append([]string{"-p", portProtocol.protocol,
+			exportTo.Add(hostnet.NewRule(append([]string{"-p", portProtocol.protocol,
 				"-m", portProtocol.protocol, "--dport", portProtocol.port}, template...)...))
 		}
 	} else {
 		// case where no 'ports' details specified in the ingress rule but 'from' details specified
-		exportTo.Add(netutils.NewRule(template...))
+		exportTo.Add(hostnet.NewRule(template...))
 	}
 	return
 }
 
-func (pp *protocolAndPortListType) Add(port ...*protocolAndPort) {
-	*pp = append(*pp, port...)
+///////////////////////////////////
+func (pp *networkPolicyType) AddPorts(port ...*protocolAndPort) {
+	(*pp).ports = append((*pp).ports, port...)
 }
 
 func (pp *protocolAndPortListType) Size() int {
@@ -444,6 +451,19 @@ func (pi *networkPolicyInfo) checkNamespace(ns *api.Namespace) bool {
 
 func (pi *podInfo) String() string {
 	return fmt.Sprintf("Namespace: %s, Name: %s, IP: %s\n\tPodSelector: %v", pi.namespace, pi.name, pi.ip, "")
+}
+
+func (pi *podInfo) AppendIPs(ips ...*net.IPNet) {
+	var ipToAdd = make([]*net.IPNet, 0)
+	for _, ipNet := range ips {
+		for _, ip := range pi.ip {
+			if ip.IP.Equal(ipNet.IP) {
+				continue
+			}
+		}
+		ipToAdd = append(ipToAdd, ipNet)
+	}
+	pi.ip = append(pi.ip, ipToAdd...)
 }
 
 func (pd *podListType) String() (out string) {

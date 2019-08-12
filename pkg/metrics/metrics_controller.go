@@ -1,29 +1,27 @@
 package metrics
 
 import (
-	"net"
 	"net/http"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/cloudnativelabs/kube-router/pkg/controllers"
 	"github.com/cloudnativelabs/kube-router/pkg/healthcheck"
+	"github.com/cloudnativelabs/kube-router/pkg/helpers/tools"
 	"github.com/cloudnativelabs/kube-router/pkg/options"
 	"github.com/golang/glog"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"golang.org/x/net/context"
-	"k8s.io/client-go/kubernetes"
 )
 
 const (
 	namespace = "kube_router"
 )
 
-var CONTROLLER_NAME = []string{"Metrics controller", "MC"}
-
 var (
+	defaultBucket = prometheus.ExponentialBuckets(0.005, 2.327, 10)
+	fastBucket    = prometheus.ExponentialBuckets(0.001, 2.5, 10)
+
 	// ServiceTotalConn Total incoming connections made
 	ServiceTotalConn = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: namespace,
@@ -95,18 +93,21 @@ var (
 		Namespace: namespace,
 		Name:      "controller_iptables_sync_time",
 		Help:      "Time it took for controller to sync iptables",
+		Buckets:   defaultBucket,
 	})
 	// ControllerIpvsServicesSyncTime Time it took for controller to sync ipvs services
 	ControllerIpvsServicesSyncTime = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Namespace: namespace,
 		Name:      "controller_ipvs_services_sync_time",
 		Help:      "Time it took for controller to sync ipvs services",
+		Buckets:   defaultBucket,
 	})
 	// ControllerRoutesSyncTime Time it took for controller to sync ipvs services
 	ControllerRoutesSyncTime = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Namespace: namespace,
 		Name:      "controller_routes_sync_time",
 		Help:      "Time it took for controller to sync routes",
+		Buckets:   defaultBucket,
 	})
 	// ControllerBPGpeers BGP peers in the runtime configuration
 	ControllerBPGpeers = prometheus.NewGauge(prometheus.GaugeOpts{
@@ -119,14 +120,15 @@ var (
 		Namespace: namespace,
 		Name:      "controller_bgp_internal_peers_sync_time",
 		Help:      "Time it took to sync internal bgp peers",
+		Buckets:   fastBucket,
 	})
-	// ControllerBGPadvertisementsReceived Time it took to sync internal bgp peers
+	// ControllerBGPadvertisementsReceived Number of received route advertisements
 	ControllerBGPadvertisementsReceived = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: namespace,
 		Name:      "controller_bgp_advertisements_received",
 		Help:      "BGP advertisements received",
 	})
-	// ControllerBGPadvertisementsSent Time it took to sync internal bgp peers
+	// ControllerBGPadvertisementsSent Number of received route advertisements
 	ControllerBGPadvertisementsSent = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: namespace,
 		Name:      "controller_bgp_advertisements_sent",
@@ -137,55 +139,46 @@ var (
 		Namespace: namespace,
 		Name:      "controller_ipvs_metrics_export_time",
 		Help:      "Time it took to export metrics",
+		Buckets:   fastBucket,
 	})
-	// ControllerPolicyChainsSyncTime Time it took for controller to sync policys
+	// ControllerPolicyChainsSyncTime Time it took for controller to sync policies
 	ControllerPolicyChainsSyncTime = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Namespace: namespace,
 		Name:      "controller_policy_chains_sync_time",
 		Help:      "Time it took for controller to sync policy chains",
+		Buckets:   defaultBucket,
 	})
 )
 
 // Controller Holds settings for the metrics controller
-type Controller struct {
-	MetricsPath string
-	MetricsPort uint16
-	nodeIP      net.IP
-}
-
-func (mc *Controller) GetData() ([]string, time.Duration) {
-	return CONTROLLER_NAME, time.Duration(5 * time.Second)
+type MetricsController struct {
+	controllers.Controller
 }
 
 // Run prometheus metrics controller
-func (mc *Controller) Run(healthChan chan *controllers.ControllerHeartbeat, stopCh <-chan struct{}, wg *sync.WaitGroup) error {
+func (mc *MetricsController) run(stopCh <-chan struct{}) error {
 	t := time.NewTicker(3 * time.Second)
-	defer wg.Done()
-	glog.Info("Starting metrics controller")
 
 	// register metrics for this controller
 	prometheus.MustRegister(ControllerIpvsMetricsExportTime)
 
-	srv := &http.Server{Addr: ":" + strconv.Itoa(int(mc.MetricsPort)), Handler: http.DefaultServeMux}
+	srv := &tools.HttpStartStopWrapper{
+		Server: &http.Server{
+			Addr:    ":" + strconv.Itoa(int(mc.GetConfig().MetricsPort)),
+			Handler: http.DefaultServeMux,
+		},
+	}
 
 	// add prometheus handler on metrics path
-	http.Handle(mc.MetricsPath, promhttp.Handler())
+	http.Handle(mc.GetConfig().MetricsPath, promhttp.Handler())
+	go srv.ServeAndLogReturn()
 
-	go func() {
-		if err := srv.ListenAndServe(); err != nil {
-			// cannot panic, because this probably is an intentional close
-			glog.Errorf("Metrics controller error: %s", err)
-		}
-	}()
 	for {
-		healthcheck.SendHeartBeat(healthChan, mc, nil)
+		healthcheck.SendHeartBeat(mc, nil)
 		select {
 		case <-stopCh:
-			glog.Infof("Shutting down metrics controller")
-			if err := srv.Shutdown(context.Background()); err != nil {
-				glog.Errorf("could not shutdown: %v", err)
-			}
-			return nil
+			glog.Infof("Shutting down %s", mc.GetControllerName())
+			return srv.ShutDown()
 		case <-t.C:
 			glog.V(4).Info("Metrics controller tick")
 		}
@@ -193,9 +186,8 @@ func (mc *Controller) Run(healthChan chan *controllers.ControllerHeartbeat, stop
 }
 
 // NewMetricsController returns new MetricController object
-func NewMetricsController(clientset kubernetes.Interface, config *options.KubeRouterConfig) (*Controller, error) {
-	mc := Controller{}
-	mc.MetricsPath = config.MetricsPath
-	mc.MetricsPort = config.MetricsPort
-	return &mc, nil
+func NewMetricsController(config *options.KubeRouterConfig) controllers.ControllerType {
+	mc := &MetricsController{}
+	mc.Init("Metrics controller", time.Duration(5*time.Second), config, mc.run)
+	return mc
 }

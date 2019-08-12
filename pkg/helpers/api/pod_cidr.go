@@ -1,4 +1,4 @@
-package utils
+package api
 
 import (
 	"encoding/json"
@@ -50,20 +50,21 @@ func GetPodCidrFromCniSpec(cniConfFilePath string) (*net.IPNet, error) {
 	return &ipn, nil
 }
 
-// InsertPodCidrInCniSpec inserts the pod CIDR allocated to the node by kubernetes controlller manager
+// UpdateCNIWithValues inserts the pod CIDR allocated to the node by kubernetes controlller manager
 // and stored it in the CNI specification
-func InsertPodCidrInCniSpec(cniConfFilePath string, cidr string) error {
+func UpdateCNIWithValues(cniConfFilePath string, kubeInterface string, fn func(map[string]interface{}, interface{}) bool, value interface{}) error {
 	file, err := ioutil.ReadFile(cniConfFilePath)
 	if err != nil {
 		return fmt.Errorf("Failed to load CNI conf file: %s", err.Error())
 	}
+
 	var config interface{}
+	if err = json.Unmarshal(file, &config); err != nil {
+		return fmt.Errorf("Failed to parse JSON from CNI conf file: %s", err.Error())
+	}
+
+	valueUpdated := false
 	if strings.HasSuffix(cniConfFilePath, ".conflist") {
-		err = json.Unmarshal(file, &config)
-		if err != nil {
-			return fmt.Errorf("Failed to parse JSON from CNI conf file: %s", err.Error())
-		}
-		updatedCidr := false
 		configMap := config.(map[string]interface{})
 		for key := range configMap {
 			if key != "plugins" {
@@ -73,34 +74,43 @@ func InsertPodCidrInCniSpec(cniConfFilePath string, cidr string) error {
 			// and insert the CIDR for the node
 			pluginConfigs := configMap["plugins"].([]interface{})
 			for _, pluginConfig := range pluginConfigs {
-				pluginConfigMap := pluginConfig.(map[string]interface{})
-				if val, ok := pluginConfigMap["ipam"]; ok {
-					valObj := val.(map[string]interface{})
-					valObj["subnet"] = cidr
-					updatedCidr = true
+				pluginConfigTyped := pluginConfig.(map[string]interface{})
+				if pluginConfigTyped["bridge"] != kubeInterface {
+					continue
+				}
+				if valueUpdated = fn(pluginConfigTyped, value); valueUpdated {
 					break
 				}
 			}
 		}
 
-		if !updatedCidr {
-			return fmt.Errorf("Failed to insert subnet cidr into CNI conf file: %s as CNI file is invalid.", cniConfFilePath)
-		}
-
 	} else {
-		err = json.Unmarshal(file, &config)
-		if err != nil {
-			return fmt.Errorf("Failed to parse JSON from CNI conf file: %s", err.Error())
-		}
-		pluginConfig := config.(map[string]interface{})
-		pluginConfig["ipam"].(map[string]interface{})["subnet"] = cidr
+		valueUpdated = fn(config.(map[string]interface{}), value)
 	}
+
+	if !valueUpdated {
+		return fmt.Errorf("Failed to insert subnet value into CNI conf file: %s as CNI file is invalid.", cniConfFilePath)
+	}
+
 	configJSON, _ := json.Marshal(config)
 	err = ioutil.WriteFile(cniConfFilePath, configJSON, 0644)
 	if err != nil {
-		return fmt.Errorf("Failed to insert subnet cidr into CNI conf file: %s", err.Error())
+		return fmt.Errorf("Failed to insert subnet value into CNI conf file: %s", err.Error())
 	}
 	return nil
+}
+
+func UpdateSubnet(pluginConfigMap map[string]interface{}, cidr interface{}) bool {
+	if val, ok := pluginConfigMap["ipam"]; ok {
+		val.(map[string]interface{})["subnet"] = cidr.(string)
+		return true
+	}
+	return false
+}
+
+func UpdateMtu(pluginConfigMap map[string]interface{}, mtu interface{}) bool {
+	pluginConfigMap["mtu"] = mtu.(int)
+	return true
 }
 
 // GetPodCidrFromNodeSpec reads the pod CIDR allocated to the node from API node object and returns it

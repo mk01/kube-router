@@ -1,11 +1,12 @@
-package netutils
+package hostnet
 
 import (
 	"errors"
 	"fmt"
-	"github.com/cloudnativelabs/kube-router/pkg/utils"
+	"github.com/cloudnativelabs/kube-router/pkg/helpers/tools"
 	"github.com/golang/glog"
 	"io/ioutil"
+	"net"
 	"os"
 	"os/exec"
 	"strings"
@@ -24,6 +25,7 @@ type RouteTableType struct {
 	ForChecking RouteTableCheck
 	CmdDisable  []string
 	ForProto    ProtocolMapType
+	Src         net.IP
 }
 
 type RouteTableMapType map[string]RouteTableType
@@ -64,26 +66,34 @@ func (rtm *RouteTableManager) setupRouteTable() error {
 			return errors.New("Failed add route table " + rt + ": " + err.Error())
 		}
 	}
+
+	glog.V(1).Infof("RTM: Done ensuring custom route tables exists")
 	return nil
 }
 
 func (rtm *RouteTableManager) setupCustomRouteTable(inet []string, rt *RouteTableType) error {
 	args := append(inet, rt.ForChecking.Cmd...)
-	out, err := exec.Command(utils.GetPath("ip"), args...).Output()
+	out, err := exec.Command(tools.GetExecPath("ip"), args...).Output()
 	if err != nil || !strings.Contains(string(out), rt.ForChecking.Output) {
 		if err = rtm.setupRouteTable(); err == nil {
-			out, err = exec.Command(utils.GetPath("ip"), args...).Output()
+			out, err = exec.Command(tools.GetExecPath("ip"), args...).Output()
 		}
 	}
 	if err != nil {
 		return errors.New("Failed to create " + rt.Name + " route table: " + err.Error() + " #cmdrun: " + fmt.Sprint(args))
 	}
 	if !strings.Contains(string(out), rt.ForChecking.Output) {
+		// in case rule is having fixed prio and it was changed.
+		// remove old one first
+		rtm.disable(inet, rt)
+
 		args = append(inet, rt.Cmd...)
-		if err = exec.Command(utils.GetPath("ip"), args...).Run(); err != nil {
+		if err = exec.Command(tools.GetExecPath("ip"), args...).Run(); err != nil {
 			return errors.New("Failed to run: " + strings.Join(args, " ") + ": " + err.Error())
 		}
 	}
+
+	glog.V(1).Infof("RTM: Done ensuring custom route tables rules")
 	return nil
 }
 
@@ -100,10 +110,10 @@ func (rtm *RouteTableManager) wrap(f func([]string, *RouteTableType) error, rt *
 
 func (rtm *RouteTableManager) disable(inet []string, rt *RouteTableType) (err error) {
 	args := append(inet, "route", "flush", "table", rt.Name)
-	err = exec.Command(utils.GetPath("ip"), args...).Run()
+	err = exec.Command(tools.GetExecPath("ip"), args...).Run()
 	if err == nil && rt.CmdDisable != nil {
 		args = append(inet, rt.CmdDisable...)
-		err = exec.Command(utils.GetPath("ip"), args...).Run()
+		err = exec.Command(tools.GetExecPath("ip"), args...).Run()
 	}
 	return
 }

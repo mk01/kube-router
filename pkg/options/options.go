@@ -6,10 +6,23 @@ import (
 
 	"strconv"
 
+	"github.com/cloudnativelabs/kube-router/pkg/helpers/api"
+	"github.com/cloudnativelabs/kube-router/pkg/helpers/hostnet"
+	"github.com/golang/glog"
 	"github.com/spf13/pflag"
+	"k8s.io/api/core/v1"
+	"k8s.io/client-go/kubernetes"
 )
 
 const DEFAULT_BGP_PORT = 179
+const KUBE_BRIDGE_IF = "kube-bridge"
+
+type NodeInfoType interface {
+	GetNodeName() string
+	GetNodeIP() *net.IPNet
+	GetNodeIF() string
+	GetNode() *v1.Node
+}
 
 type KubeRouterConfig struct {
 	AdvertiseClusterIp      bool
@@ -37,6 +50,7 @@ type KubeRouterConfig struct {
 	IPTablesSyncPeriod      time.Duration
 	IpvsSyncPeriod          time.Duration
 	Kubeconfig              string
+	LogRejects              bool
 	MasqueradeAll           bool
 	Master                  string
 	MetricsEnabled          bool
@@ -57,6 +71,19 @@ type KubeRouterConfig struct {
 	Version                 bool
 	VLevel                  string
 	// FullMeshPassword    string
+
+	KubeRouterPid int
+	ClientSet     kubernetes.Interface
+	NodeInfo
+}
+
+type NodeInfo struct {
+	nodeIP   *net.IPNet
+	nodeIF   string
+	nodeName string
+	node     *v1.Node
+
+	NodeInfoType
 }
 
 func NewKubeRouterConfig() *KubeRouterConfig {
@@ -89,6 +116,8 @@ func (s *KubeRouterConfig) AddFlags(fs *pflag.FlagSet) {
 		"Path to kubeconfig file with authorization information (the master location is set by the master flag).")
 	fs.BoolVar(&s.CleanupConfig, "cleanup-config", false,
 		"Cleanup iptables rules, ipvs, ipset configuration and exit.")
+	fs.BoolVar(&s.LogRejects, "log-rejects", false,
+		"Dropped packets will be logged via LOG target.")
 	fs.BoolVar(&s.MasqueradeAll, "masquerade-all", false,
 		"SNAT all traffic to cluster IP/node port.")
 	fs.StringVar(&s.ClusterCIDR, "cluster-cidr", s.ClusterCIDR,
@@ -156,4 +185,40 @@ func (s *KubeRouterConfig) AddFlags(fs *pflag.FlagSet) {
 	fs.BoolVar(&s.OverrideNextHop, "override-nexthop", false, "Override the next-hop in bgp routes sent to peers with the local ip.")
 	fs.BoolVar(&s.DisableSrcDstCheck, "disable-source-dest-check", true,
 		"Disable the source-dest-check attribute for AWS EC2 instances. When this option is false, it must be set some other way.")
+}
+
+func (cc *NodeInfo) InitCommons(config *KubeRouterConfig) {
+	node, err := api.GetNodeObject(config.ClientSet, config.HostnameOverride)
+	if err != nil {
+		glog.Fatal("Failed getting node object from API server: " + err.Error())
+	}
+
+	cc.node = node
+	cc.nodeName = node.Name
+
+	nodeIP := api.GetNodeIP(node)
+	if nodeIP == nil {
+		glog.Fatal("Failed getting IP address from node object:")
+	}
+
+	if cc.nodeIP, cc.nodeIF, err = hostnet.GetIPWithSubnet(nodeIP); err != nil {
+		glog.Fatal("Failed find the subnet of the node IP and interface on" +
+			"which its configured: " + err.Error())
+	}
+}
+
+func (cc *NodeInfo) GetNodeIP() *net.IPNet {
+	return cc.nodeIP
+}
+
+func (cc *NodeInfo) GetNodeIF() string {
+	return cc.nodeIF
+}
+
+func (cc *NodeInfo) GetNodeName() string {
+	return cc.nodeName
+}
+
+func (cc *NodeInfo) GetNode() *v1.Node {
+	return cc.node
 }
