@@ -171,7 +171,7 @@ func (nrc *NetworkRoutingController) getCheckNodeAsn(node *v1core.Node, nodeIP s
 }
 
 // connectToExternalBGPPeers adds all the configured eBGP peers (global or node specific) as neighbours
-func connectToExternalBGPPeers(server *gobgp.BgpServer, peerNeighbors []*config.Neighbor, bgpGracefulRestart bool, peerMultihopTtl uint8) error {
+func connectToExternalBGPPeers(server *gobgp.BgpServer, peerNeighbors []*config.Neighbor, krConfig *options.KubeRouterConfig, peerMultihopTtl uint8) error {
 	for _, n := range peerNeighbors {
 
 		injectGrRestart(krConfig, n, false)

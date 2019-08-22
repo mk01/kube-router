@@ -123,6 +123,15 @@ func (kr *KubeRouter) Run() error {
 			Run(stopCh, &wg, kr.hc)
 	}
 
+	if kr.Config.BGPGracefulRestart {
+		if kr.Config.BGPGracefulRestartDeferralTime > time.Hour*18 {
+			return errors.New("BGPGracefuleRestartDeferralTime should be less than 18 hours")
+		}
+		if kr.Config.BGPGracefulRestartDeferralTime <= 0 {
+			return errors.New("BGPGracefuleRestartDeferralTime must be positive")
+		}
+	}
+
 	if kr.Config.RunRouter {
 		go routing.NewNetworkRoutingController(kr.Config, nodeInformer, svcInformer, epInformer).Run(stopCh, &wg, kr.hc)
 	}

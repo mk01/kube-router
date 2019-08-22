@@ -11,6 +11,7 @@ import (
 	"github.com/cloudnativelabs/kube-router/pkg/helpers/api"
 	"github.com/cloudnativelabs/kube-router/pkg/helpers/hostnet"
 	"github.com/cloudnativelabs/kube-router/pkg/helpers/tools"
+	"github.com/cloudnativelabs/kube-router/pkg/options"
 	"github.com/golang/glog"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/osrg/gobgp/config"
