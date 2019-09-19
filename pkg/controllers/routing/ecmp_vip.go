@@ -76,13 +76,13 @@ func getServiceObject(obj interface{}) (svc *v1core.Service) {
 	return
 }
 
-func (nrc *NetworkRoutingController) handleServiceUpdate(svc *v1core.Service) {
+func (nrc *NetworkRoutingController) handleServiceUpdate(svc *v1core.Service, adv bool) {
 	if !nrc.bgpServerStarted {
 		glog.V(3).Infof("Skipping update to service: %s/%s, controller still performing bootup full-sync", svc.Namespace, svc.Name)
 		return
 	}
 
-	toAdvertise, toWithdraw, err := nrc.getVIPsForService(svc, true)
+	toAdvertise, toWithdraw, err := nrc.getVIPsForService(svc, true, adv)
 	if err != nil {
 		glog.Errorf("error getting routes for service: %s, err: %s", svc.Name, err)
 		return
@@ -98,22 +98,21 @@ func (nrc *NetworkRoutingController) handleServiceUpdate(svc *v1core.Service) {
 	nrc.withdrawVIPs(toWithdraw)
 }
 
-func (nrc *NetworkRoutingController) tryHandleServiceUpdate(obj interface{}, logMsgFormat string) {
+func (nrc *NetworkRoutingController) tryHandleServiceUpdate(obj interface{}, logMsgFormat string, advertise bool) {
 	if svc := getServiceObject(obj); svc != nil {
 		glog.V(1).Infof(logMsgFormat, svc.Namespace, svc.Name)
-		nrc.handleServiceUpdate(svc)
+		nrc.handleServiceUpdate(svc, advertise)
 	}
 }
 
 // OnServiceCreate handles new service create event from the kubernetes API server
 func (nrc *NetworkRoutingController) OnServiceCreate(obj interface{}) {
-	nrc.tryHandleServiceUpdate(obj, "Received new service: %s/%s from watch API")
+	nrc.tryHandleServiceUpdate(obj, "Received new service: %s/%s from watch API", true)
 }
 
 // OnServiceUpdate handles the service relates updates from the kubernetes API server
 func (nrc *NetworkRoutingController) OnServiceUpdate(objNew interface{}, objOld interface{}) {
-	nrc.tryHandleServiceUpdate(objNew, "Received update on service: %s/%s from watch API")
-
+	nrc.tryHandleServiceUpdate(objNew, "Received update on service: %s/%s from watch API", true)
 	nrc.withdrawVIPs(nrc.getWithdraw(getServiceObject(objOld), getServiceObject(objNew)))
 }
 
@@ -136,7 +135,7 @@ func getMissingPrevGen(old, new []string) (withdrawIPs []string) {
 
 // OnServiceDelete handles the service delete updates from the kubernetes API server
 func (nrc *NetworkRoutingController) OnServiceDelete(obj interface{}) {
-	nrc.tryHandleServiceUpdate(obj, "Received event to delete service: %s/%s from watch API")
+	nrc.tryHandleServiceUpdate(obj, "Received event to delete service: %s/%s from watch API", false)
 }
 
 func (nrc *NetworkRoutingController) newEndpointsEventHandler() cache.ResourceEventHandler {
@@ -198,7 +197,7 @@ func (nrc *NetworkRoutingController) OnEndpointsUpdate(obj interface{}) {
 		return
 	}
 
-	nrc.tryHandleServiceUpdate(svc, "Updating service %s/%s triggered by endpoint update event")
+	nrc.tryHandleServiceUpdate(svc, "Updating service %s/%s triggered by endpoint update event", true)
 }
 
 func (nrc *NetworkRoutingController) serviceForEndpoints(ep *v1core.Endpoints) (interface{}, error) {
@@ -274,7 +273,7 @@ func (nrc *NetworkRoutingController) getVIPs(onlyActiveEndpoints bool) ([]string
 	for _, obj := range nrc.svcLister.List() {
 		svc := obj.(*v1core.Service)
 
-		toAdvertise, toWithdraw, err := nrc.getVIPsForService(svc, onlyActiveEndpoints)
+		toAdvertise, toWithdraw, err := nrc.getVIPsForService(svc, onlyActiveEndpoints, true)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -301,25 +300,39 @@ func (nrc *NetworkRoutingController) shouldAdvertiseService(svc *v1core.Service,
 	return returnValue
 }
 
-func (nrc *NetworkRoutingController) getVIPsForService(svc *v1core.Service, onlyActiveEndpoints bool) ([]string, []string, error) {
-	ipList := make([]string, 0)
-	var err error
+func (nrc *NetworkRoutingController) getVIPsForService(svc *v1core.Service, onlyActiveEndpoints bool, adv bool) ([]string, []string, error) {
 
-	nodeHasEndpoints := true
-	if onlyActiveEndpoints {
-		_, isLocal := svc.Annotations[svcLocalAnnotation]
-		if isLocal || svc.Spec.ExternalTrafficPolicy == v1core.ServiceExternalTrafficPolicyTypeLocal {
-			nodeHasEndpoints, err = nrc.nodeHasEndpointsForService(svc)
-			if err != nil {
-				return nil, nil, err
-			}
+	advertise := adv
+
+	_, hasLocalAnnotation := svc.Annotations[svcLocalAnnotation]
+	hasLocalTrafficPolicy := svc.Spec.ExternalTrafficPolicy == v1core.ServiceExternalTrafficPolicyTypeLocal
+	isLocal := hasLocalAnnotation || hasLocalTrafficPolicy
+
+	if advertise && onlyActiveEndpoints && isLocal {
+		var err error
+		advertise, err = nrc.nodeHasEndpointsForService(svc)
+		if err != nil {
+			return nil, nil, err
 		}
 	}
 
+	ipList := nrc.getAllVIPsForService(svc)
+
+	if !advertise {
+		return nil, ipList, nil
+	}
+
+	return ipList, nil, nil
+}
+
+func (nrc *NetworkRoutingController) getAllVIPsForService(svc *v1core.Service) []string {
+
+	ipList := make([]string, 0)
+
 	if nrc.shouldAdvertiseService(svc, svcAdvertiseClusterAnnotation, nrc.GetConfig().AdvertiseClusterIp) {
-		clusterIp := nrc.getClusterIp(svc)
-		if clusterIp != "" {
-			ipList = append(ipList, clusterIp)
+		clusterIP := nrc.getClusterIp(svc)
+		if clusterIP != "" {
+			ipList = append(ipList, clusterIP)
 		}
 	}
 
@@ -334,11 +347,8 @@ func (nrc *NetworkRoutingController) getVIPsForService(svc *v1core.Service, only
 		ipList = append(ipList, nrc.getLoadBalancerIps(svc)...)
 	}
 
-	if !nodeHasEndpoints {
-		return nil, ipList, nil
-	}
+	return ipList
 
-	return ipList, nil, nil
 }
 
 func isEndpointsForLeaderElection(ep *v1core.Endpoints) bool {
