@@ -597,6 +597,10 @@ func (nsc *NetworkServicesController) syncIpvsFirewall(svcs map[*KubeService]*se
 		return tools.NewError(err.Error())
 	}
 
+	if err = nsc.syncMacIpSet(); err != nil {
+		return tools.NewError(err.Error())
+	}
+
 	// Populate service ipsets.
 	serviceIPsSets := make([]string, len(svcs))
 	ipvsServicesSets := make([]string, len(svcs))
@@ -618,12 +622,13 @@ func (nsc *NetworkServicesController) syncIpvsFirewall(svcs map[*KubeService]*se
 	}
 	set.RefreshAsync(ipvsServicesSets)
 
-	if err = nsc.syncMacIpSet(); err != nil {
-		return tools.NewError(err.Error())
+	// config.IpvsPermitAll: true then create INPUT/KUBE-ROUTER-SERVICE Chain creation else return
+	if !nsc.GetConfig().IpvsPermitAll {
+		return nil
 	}
 
 	if err = hostnet.UsedTcpProtocols.ForEach(nsc.ipvsFwBuildAux); err != nil {
-		tools.NewErrorf("Error setting up ipvs firewall: %s", err.Error())
+		return tools.NewErrorf("Error setting up ipvs firewall: %s", err.Error())
 	}
 
 	return nil
@@ -650,8 +655,8 @@ func (nsc *NetworkServicesController) syncMacIpSet() (err error) {
 
 func (nsc *NetworkServicesController) cleanupIpvsFirewall() {
 	/*
-	   - delete firewall rules
-	   - delete ipsets
+		- delete firewall rules
+		- delete ipsets
 	*/
 	hostnet.UsedTcpProtocols.ForEach(func(p hostnet.Proto) error {
 		return nsc.Ipm.IptablesCleanUpChain(p, ipvsFirewallChainName, true)
