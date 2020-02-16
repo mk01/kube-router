@@ -342,6 +342,7 @@ type NetworkServicesController struct {
 	serviceMap              serviceInfoMapType
 	configuredDsrContainers configuredDsrContainerType
 	lbHealthChecks          lbHealthChecksListType
+	excludedCidrs           []*net.IPNet
 	podCidr                 string
 	masqueradeAll           bool
 	globalHairpin           bool
@@ -917,10 +918,8 @@ func (nsc *NetworkServicesController) syncIpvsServices() (err error) {
 			continue
 		}
 
-		for _, eNet := range nsc.excludedCidrs {
-			if eNet.Contains(svc.Address) {
-				continue
-			}
+		if tools.CheckElementInArrayByFunction(svc.Address, nsc.excludedCidrs, comparerIPNet) {
+			continue
 		}
 
 		tools.Eval(nsc.ln.ipvsDelService(&KubeService{Service: svc}))
@@ -1898,6 +1897,7 @@ func NewNetworkServicesController(config *options.KubeRouterConfig,
 
 	nsc.Ipm = hostnet.NewIpTablesManager(nsc.ln.GetNodeIP().IP)
 	nsc.lbHealthChecks.healthIP = nsc.ln.GetNodeIP().IP.String()
+	nsc.excludedCidrs = hostnet.NewIPNetList(config.ExcludedCidrs)
 
 	nsc.Ipm.RegisterPeriodicFunction(nsc.ipvsServiceLBHealthChecksRule)
 
