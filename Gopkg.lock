@@ -310,10 +310,11 @@
   revision = "e89373fe6b4a7413d7acd6da1725b83ef713e6e4"
 
 [[projects]]
-  digest = "1:1d1cbf539d9ac35eb3148129f96be5537f1a1330cadcc7e3a83b4e72a59672a3"
+  digest = "1:248e9efd818d7156968df6d7d02018d2b7b6debf3ea21e81228cf0abb29b24cd"
   name = "github.com/google/go-cmp"
   packages = [
     "cmp",
+    "cmp/cmpopts",
     "cmp/internal/diff",
     "cmp/internal/flags",
     "cmp/internal/function",
@@ -1149,6 +1150,7 @@
     "github.com/eapache/channels",
     "github.com/golang/glog",
     "github.com/google/go-cmp/cmp",
+    "github.com/google/go-cmp/cmp/cmpopts",
     "github.com/mattbaird/jsonpatch",
     "github.com/mqliang/libipvs",
     "github.com/onsi/ginkgo",
