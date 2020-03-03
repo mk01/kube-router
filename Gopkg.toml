@@ -67,9 +67,13 @@ required = ["github.com/osrg/gobgp/gobgp"]
   branch = "master"
   name = "github.com/spf13/pflag"
 
+[[constraint]]
+  branch = "master"
+  name = "github.com/mqliang/libipvs"
+
 [[override]]
   name = "github.com/vishvananda/netlink"
-  version = "1.0.0"
+  revision = "e25c252266f633bfd3d835909014a55d2fbe4a73"
 
 [[constraint]]
   branch = "master"
@@ -87,13 +91,13 @@ required = ["github.com/osrg/gobgp/gobgp"]
   branch = "release-5.0"
   name = "k8s.io/client-go"
 
-[[constraint]]
-  name = "github.com/docker/libnetwork"
-  revision = "14aa49f99093e1a22e65155b641103762911db8d"
-
 [[override]]
   revision = "1e2f10eb65743fed02f573d31a4587de09afb20e"
   name = "github.com/docker/distribution"
+
+[[override]]
+  branch = "release-branch.go1.13"
+  name = "golang.org/x/sys"
 
 [prune]
   go-tests = true

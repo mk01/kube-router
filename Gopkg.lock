@@ -178,13 +178,6 @@
   version = "v0.3.3"
 
 [[projects]]
-  digest = "1:6b20706ea25f78700bfd6eda620a95233c6340acb53d295553e290c626c809c7"
-  name = "github.com/docker/libnetwork"
-  packages = ["ipvs"]
-  pruneopts = "UT"
-  revision = "14aa49f99093e1a22e65155b641103762911db8d"
-
-[[projects]]
   digest = "1:975a4480c40f2d0b95e1f83d3ec1aa29a2774e80179e08a9a4ba2aab86721b23"
   name = "github.com/eapache/channels"
   packages = ["."]
@@ -317,6 +310,20 @@
   revision = "e89373fe6b4a7413d7acd6da1725b83ef713e6e4"
 
 [[projects]]
+  digest = "1:1d1cbf539d9ac35eb3148129f96be5537f1a1330cadcc7e3a83b4e72a59672a3"
+  name = "github.com/google/go-cmp"
+  packages = [
+    "cmp",
+    "cmp/internal/diff",
+    "cmp/internal/flags",
+    "cmp/internal/function",
+    "cmp/internal/value",
+  ]
+  pruneopts = "UT"
+  revision = "2d0692c2e9617365a95b295612ac0d4415ba4627"
+  version = "v0.3.1"
+
+[[projects]]
   branch = "master"
   digest = "1:3ee90c0d94da31b442dde97c99635aaafec68d0b8a3c12ee2075c6bdabeec6bb"
   name = "github.com/google/gofuzz"
@@ -376,6 +383,14 @@
   ]
   pruneopts = "UT"
   revision = "ef8a98b0bbce4a65b5aa4c368430a80ddc533168"
+
+[[projects]]
+  branch = "master"
+  digest = "1:8769369e29d888c2a2711715bdaced34a6fb90ef0646bd20d7f4be5cbf3708f7"
+  name = "github.com/hkwi/nlgo"
+  packages = ["."]
+  pruneopts = "UT"
+  revision = "08733afbfe0463a643d46be7164fb5dc8869c77c"
 
 [[projects]]
   branch = "master"
@@ -457,6 +472,14 @@
   revision = "8b799c424f57fa123fc63a99d6383bc6e4c02578"
 
 [[projects]]
+  branch = "master"
+  digest = "1:fc2b04b0069d6b10bdef96d278fe20c345794009685ed3c8c7f1a6dc023eefec"
+  name = "github.com/mattbaird/jsonpatch"
+  packages = ["."]
+  pruneopts = "UT"
+  revision = "81af80346b1a01caae0cbc27fd3c1ba5b11e189f"
+
+[[projects]]
   digest = "1:5985ef4caf91ece5d54817c11ea25f182697534f8ae6521eadcd628c142ac4b6"
   name = "github.com/matttproud/golang_protobuf_extensions"
   packages = ["pbutil"]
@@ -487,6 +510,14 @@
   pruneopts = "UT"
   revision = "1df9eeb2bb81f327b96228865c5687bc2194af3f"
   version = "1.0.0"
+
+[[projects]]
+  branch = "master"
+  digest = "1:cbf4078aaa1bbadc9b6beb81882f4f04cc3089e5e912083e8765a49f22ad7579"
+  name = "github.com/mqliang/libipvs"
+  packages = ["."]
+  pruneopts = "UT"
+  revision = "20f197c976a3e571b49120a4ca63ba6123d67fd7"
 
 [[projects]]
   digest = "1:f4cbb10407f60c0263738e7b219b80ba99516aa9da187f44680d5b29360b3c9f"
@@ -719,15 +750,14 @@
   revision = "8dc2790b029dc41e2b8ff772c63c26adbb1db70d"
 
 [[projects]]
-  digest = "1:2d9d06cb9d46dacfdbb45f8575b39fc0126d083841a29d4fbf8d97708f43107e"
+  digest = "1:e0033a4dd40266b10c73b849f6d29995a7fa4f4637e03a324b754ba1602208aa"
   name = "github.com/vishvananda/netlink"
   packages = [
     ".",
     "nl",
   ]
   pruneopts = "UT"
-  revision = "a2ad57a690f3caf3015351d2d6e1c0b95c349752"
-  version = "v1.0.0"
+  revision = "e25c252266f633bfd3d835909014a55d2fbe4a73"
 
 [[projects]]
   branch = "master"
@@ -768,15 +798,15 @@
   revision = "61147c48b25b599e5b561d2e9c4f3e1ef489ca41"
 
 [[projects]]
-  branch = "master"
-  digest = "1:4d0a3e91e65c614186d6f0e9a65b7a1c0f80ff233634585c6f8eed728fabf4cb"
+  branch = "release-branch.go1.13"
+  digest = "1:d52ccbb025caf0a2166e0204ed934567b8d0dfdd23a09d947f1f040708888a0a"
   name = "golang.org/x/sys"
   packages = [
     "unix",
     "windows",
   ]
   pruneopts = "UT"
-  revision = "2281fa97ef7b0c26324634d5a22f04babdac8713"
+  revision = "fde4db37ae7ad8191b03d30d27f258b5291ae4e3"
 
 [[projects]]
   digest = "1:bb8277a2ca2bcad6ff7f413b939375924099be908cedd1314baa21ecd08df477"
@@ -1116,8 +1146,11 @@
     "github.com/containernetworking/cni/plugins/ipam/host-local/backend/allocator",
     "github.com/coreos/go-iptables/iptables",
     "github.com/docker/docker/client",
-    "github.com/docker/libnetwork/ipvs",
+    "github.com/eapache/channels",
     "github.com/golang/glog",
+    "github.com/google/go-cmp/cmp",
+    "github.com/mattbaird/jsonpatch",
+    "github.com/mqliang/libipvs",
     "github.com/onsi/ginkgo",
     "github.com/onsi/gomega",
     "github.com/osrg/gobgp/api",
@@ -1126,18 +1159,20 @@
     "github.com/osrg/gobgp/packet/bgp",
     "github.com/osrg/gobgp/server",
     "github.com/osrg/gobgp/table",
+    "github.com/pkg/errors",
     "github.com/prometheus/client_golang/prometheus",
     "github.com/prometheus/client_golang/prometheus/promhttp",
     "github.com/spf13/pflag",
     "github.com/vishvananda/netlink",
-    "github.com/vishvananda/netns",
+    "github.com/vishvananda/netlink/nl",
     "golang.org/x/net/context",
     "k8s.io/api/core/v1",
     "k8s.io/api/extensions/v1beta1",
     "k8s.io/api/networking/v1",
     "k8s.io/apimachinery/pkg/apis/meta/v1",
     "k8s.io/apimachinery/pkg/labels",
-    "k8s.io/apimachinery/pkg/util/sets",
+    "k8s.io/apimachinery/pkg/types",
+    "k8s.io/apimachinery/pkg/util/intstr",
     "k8s.io/client-go/informers",
     "k8s.io/client-go/kubernetes",
     "k8s.io/client-go/kubernetes/fake",
