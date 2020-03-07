@@ -2,6 +2,7 @@ package hostconf
 
 import (
 	"fmt"
+	"github.com/cloudnativelabs/kube-router/pkg/helpers/tools"
 	"github.com/golang/glog"
 	"io/ioutil"
 	"os"
@@ -32,14 +33,16 @@ func (e *SysctlError) IsFatal() bool {
 	return e.fatal
 }
 
-func (sctl *SysCtlConfigRuleListType) Apply() (err error) {
-	var errs []error
+func (sctl *SysCtlConfigRuleListType) Apply() (oerr error) {
 	for i := range *sctl {
-		if err = (*sctl)[i].SetValue(); err != nil {
-			errs = append(errs, err)
+		if err := (*sctl)[i].SetValue(); err != nil {
+			oerr = tools.AppendErrorf(oerr, err.Error())
 		}
 	}
-	return errs[len(errs)-1]
+	if oerr != nil {
+
+	}
+	return
 }
 
 // SetValue sets a sysctl value
