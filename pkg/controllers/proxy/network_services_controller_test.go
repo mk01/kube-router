@@ -2,6 +2,9 @@ package proxy
 
 import (
 	"fmt"
+	"github.com/cloudnativelabs/kube-router/pkg/controllers"
+	"github.com/cloudnativelabs/kube-router/pkg/helpers/hostnet"
+	"github.com/cloudnativelabs/kube-router/pkg/options"
 	"net"
 	"time"
 
@@ -49,7 +52,7 @@ func (lnm *LinuxNetworkingMockImpl) ipvsGetServices() ipvsServiceArrayType {
 func (lnm *LinuxNetworkingMockImpl) ipAddrAdd(iface netlink.Link, ip *net.IPNet, addRoute bool) error {
 	return nil
 }
-func (lnm *LinuxNetworkingMockImpl) ipvsAddServer(ks *KubeService, ep *endpointInfo, update bool) (bool, error) {
+func (lnm *LinuxNetworkingMockImpl) ipvsAddServer(ks *KubeService, ep *endpointInfo) (bool, error) {
 	return false, nil
 }
 func (lnm *LinuxNetworkingMockImpl) ipvsAddService(ks *KubeService, update bool) (*libipvs.Service, error) {
@@ -141,9 +144,15 @@ var _ = Describe("NetworkServicesController", func() {
 		}
 
 		nsc = &NetworkServicesController{
-			nodeIP:       net.ParseIP("10.0.0.0"),
-			nodeHostName: "node-1",
-			ln:           mockedLinuxNetworking,
+			Controller: controllers.Controller{
+				Config: &options.KubeRouterConfig{
+					NodeInfo: options.NodeInfo{
+						NodeName: "node-1",
+						NodeIP:   hostnet.NewIP("10.0.0.0").ToIPNet(),
+					},
+				},
+			},
+			ln: mockedLinuxNetworking,
 		}
 
 		startInformersForServiceProxy(nsc, clientset)
@@ -175,7 +184,7 @@ var _ = Describe("NetworkServicesController", func() {
 		JustBeforeEach(func() {
 			// pre-inject some foo Ipvs Service to verify its deletion
 			fooSvc1, _ = lnm.ipvsAddService(&KubeService{Service: &libipvs.Service{Address: net.ParseIP("1.2.3.4"), Protocol: 6, Port: 1234}}, false)
-			fooSvc2, _ = lnm.ipvsAddService(&KubeService{Service: &libipvs.Service{Address: net.ParseIP("1.2.3.4"), Protocol: 6, Port: 1234}}, false)
+			fooSvc2, _ = lnm.ipvsAddService(&KubeService{Service: &libipvs.Service{Address: net.ParseIP("5.6.7.8"), Protocol: 6, Port: 5678}}, false)
 			syncErr = nsc.syncIpvsServices()
 		})
 		It("Should have called syncIpvsServices OK", func() {

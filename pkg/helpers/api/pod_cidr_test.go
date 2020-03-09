@@ -24,7 +24,7 @@ func Test_GetPodCidrFromCniSpec(t *testing.T) {
 	}{
 		{
 			"CNI config file has subnet",
-			`{"bridge":options.KUBE_BRIDGE_IFACE","ipam":{"subnet":"172.17.0.0/24","type":"host-local"},"isDefaultGateway":true,"name":"kubernetes","type":"bridge"}`,
+			`{"bridge":"kube-bridge","ipam":{"subnet":"172.17.0.0/24","type":"host-local"},"isDefaultGateway":true,"name":"kubernetes","type":"bridge"}`,
 			&net.IPNet{
 				IP:   net.IPv4(172, 17, 0, 0),
 				Mask: net.IPv4Mask(255, 255, 255, 0),
@@ -34,7 +34,7 @@ func Test_GetPodCidrFromCniSpec(t *testing.T) {
 		},
 		{
 			"CNI config file missing subnet",
-			`{"bridge":options.KUBE_BRIDGE_IFACE","ipam":{"type":"host-local"},"isDefaultGateway":true,"name":"kubernetes","type":"bridge"}`,
+			`{"bridge":"kube-bridge","ipam":{"type":"host-local"},"isDefaultGateway":true,"name":"kubernetes","type":"bridge"}`,
 			&net.IPNet{},
 			nil,
 			"10-kuberouter.conf",
@@ -77,16 +77,16 @@ func Test_InsertPodCidrInCniSpec(t *testing.T) {
 		{
 			"insert cidr to cni config",
 			"172.17.0.0/24",
-			`{"bridge":options.KUBE_BRIDGE_IFACE","ipam":{"type":"host-local"},"isDefaultGateway":true,"name":"kubernetes","type":"bridge"}`,
-			`{"bridge":options.KUBE_BRIDGE_IFACE","ipam":{"subnet":"172.17.0.0/24","type":"host-local"},"isDefaultGateway":true,"name":"kubernetes","type":"bridge"}`,
+			`{"bridge":"kube-bridge","ipam":{"type":"host-local"},"isDefaultGateway":true,"name":"kubernetes","type":"bridge"}`,
+			`{"bridge":"kube-bridge","ipam":{"subnet":"172.17.0.0/24","type":"host-local"},"isDefaultGateway":true,"name":"kubernetes","type":"bridge"}`,
 			nil,
 			"/tmp/10-kuberouter.conf",
 		},
 		{
 			"insert cidr to cni config",
 			"172.17.0.0/24",
-			`{"cniVersion":"0.3.0","name":"mynet","plugins":[{"bridge":options.KUBE_BRIDGE_IFACE","ipam":{"type":"host-local"},"isDefaultGateway":true,"name":"kubernetes","type":"bridge"},{"type":"portmap"}]}`,
-			`{"cniVersion":"0.3.0","name":"mynet","plugins":[{"bridge":options.KUBE_BRIDGE_IFACE","ipam":{"subnet":"172.17.0.0/24","type":"host-local"},"isDefaultGateway":true,"name":"kubernetes","type":"bridge"},{"type":"portmap"}]}`,
+			`{"cniVersion":"0.3.0","name":"mynet","plugins":[{"bridge":"kube-bridge","ipam":{"type":"host-local"},"isDefaultGateway":true,"name":"kubernetes","type":"bridge"},{"type":"portmap"}]}`,
+			`{"cniVersion":"0.3.0","name":"mynet","plugins":[{"bridge":"kube-bridge","ipam":{"subnet":"172.17.0.0/24","type":"host-local"},"isDefaultGateway":true,"name":"kubernetes","type":"bridge"},{"type":"portmap"}]}`,
 			nil,
 			"/tmp/10-kuberouter.conflist",
 		},
@@ -101,7 +101,7 @@ func Test_InsertPodCidrInCniSpec(t *testing.T) {
 			}
 			defer os.Remove(cniConfigFile.Name())
 
-			err = UpdateCNIWithValues(cniConfigFile.Name(), testcase.podCidr)
+			err = UpdateCNIWithValues(cniConfigFile.Name(), "kube-bridge", UpdateSubnet, testcase.podCidr)
 			if !reflect.DeepEqual(err, testcase.err) {
 				t.Logf("actual error: %v", err)
 				t.Logf("expected error: %v", err)

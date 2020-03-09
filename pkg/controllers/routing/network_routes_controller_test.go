@@ -2,7 +2,7 @@ package routing
 
 import (
 	"errors"
-	"net"
+	"github.com/cloudnativelabs/kube-router/pkg/helpers/async_worker"
 	"os"
 	"reflect"
 	"testing"
@@ -12,13 +12,19 @@ import (
 	gobgp "github.com/osrg/gobgp/server"
 	"github.com/osrg/gobgp/table"
 
+	"github.com/cloudnativelabs/kube-router/pkg/controllers"
+	"github.com/cloudnativelabs/kube-router/pkg/helpers/hostnet"
+	"github.com/cloudnativelabs/kube-router/pkg/options"
 	v1core "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/cache"
+	"sync"
 )
+
+var port int32 = 10000
 
 func Test_advertiseClusterIPs(t *testing.T) {
 	testcases := []struct {
@@ -31,6 +37,15 @@ func Test_advertiseClusterIPs(t *testing.T) {
 		{
 			"add bgp path for service with ClusterIP",
 			&NetworkRoutingController{
+				Controller: controllers.Controller{
+					Config: &options.KubeRouterConfig{
+						NodeInfo: options.NodeInfo{
+							NodeName: "",
+							NodeIP:   hostnet.NewIP("192.168.1.1").ToIPNet(),
+							NodeIF:   "eth0",
+						},
+					},
+				},
 				bgpServer: gobgp.NewBgpServer(),
 			},
 			[]*v1core.Service{
@@ -51,6 +66,15 @@ func Test_advertiseClusterIPs(t *testing.T) {
 		{
 			"add bgp path for service with ClusterIP/NodePort/LoadBalancer",
 			&NetworkRoutingController{
+				Controller: controllers.Controller{
+					Config: &options.KubeRouterConfig{
+						NodeInfo: options.NodeInfo{
+							NodeName: "",
+							NodeIP:   hostnet.NewIP("192.168.1.1").ToIPNet(),
+							NodeIF:   "eth0",
+						},
+					},
+				},
 				bgpServer: gobgp.NewBgpServer(),
 			},
 			[]*v1core.Service{
@@ -91,6 +115,15 @@ func Test_advertiseClusterIPs(t *testing.T) {
 		{
 			"add bgp path for invalid service type",
 			&NetworkRoutingController{
+				Controller: controllers.Controller{
+					Config: &options.KubeRouterConfig{
+						NodeInfo: options.NodeInfo{
+							NodeName: "",
+							NodeIP:   hostnet.NewIP("192.168.1.1").ToIPNet(),
+							NodeIF:   "eth0",
+						},
+					},
+				},
 				bgpServer: gobgp.NewBgpServer(),
 			},
 			[]*v1core.Service{
@@ -120,6 +153,15 @@ func Test_advertiseClusterIPs(t *testing.T) {
 		{
 			"add bgp path for headless service",
 			&NetworkRoutingController{
+				Controller: controllers.Controller{
+					Config: &options.KubeRouterConfig{
+						NodeInfo: options.NodeInfo{
+							NodeName: "",
+							NodeIP:   hostnet.NewIP("192.168.1.1").ToIPNet(),
+							NodeIF:   "eth0",
+						},
+					},
+				},
 				bgpServer: gobgp.NewBgpServer(),
 			},
 			[]*v1core.Service{
@@ -158,19 +200,19 @@ func Test_advertiseClusterIPs(t *testing.T) {
 	}
 
 	for _, testcase := range testcases {
+		port++
 		t.Run(testcase.name, func(t *testing.T) {
 			go testcase.nrc.bgpServer.Serve()
 			err := testcase.nrc.bgpServer.Start(&config.Global{
 				Config: config.GlobalConfig{
 					As:       1,
 					RouterId: "10.0.0.0",
-					Port:     10000,
+					Port:     port,
 				},
 			})
 			if err != nil {
 				t.Fatalf("failed to start BGP server: %v", err)
 			}
-			defer testcase.nrc.bgpServer.Stop()
 			w := testcase.nrc.bgpServer.Watch(gobgp.WatchBestPath(false))
 
 			clientset := fake.NewSimpleClientset()
@@ -184,9 +226,9 @@ func Test_advertiseClusterIPs(t *testing.T) {
 			waitForListerWithTimeout(testcase.nrc.svcLister, time.Second*10, t)
 
 			// ClusterIPs
-			testcase.nrc.advertiseClusterIP = true
-			testcase.nrc.advertiseExternalIP = false
-			testcase.nrc.advertiseLoadBalancerIP = false
+			testcase.nrc.GetConfig().AdvertiseClusterIp = true
+			testcase.nrc.GetConfig().AdvertiseExternalIp = false
+			testcase.nrc.GetConfig().AdvertiseLoadBalancerIp = false
 
 			toAdvertise, toWithdraw, _ := testcase.nrc.getActiveVIPs()
 			testcase.nrc.advertiseVIPs(toAdvertise)
@@ -202,6 +244,7 @@ func Test_advertiseClusterIPs(t *testing.T) {
 					}
 				}
 			}
+			async_worker.GlobalManager.StopWorkerManager()
 		})
 	}
 }
@@ -217,7 +260,15 @@ func Test_advertiseExternalIPs(t *testing.T) {
 		{
 			"add bgp path for service with external IPs",
 			&NetworkRoutingController{
-				bgpServer: gobgp.NewBgpServer(),
+				Controller: controllers.Controller{
+					Config: &options.KubeRouterConfig{
+						NodeInfo: options.NodeInfo{
+							NodeName: "",
+							NodeIP:   hostnet.NewIP("192.168.1.1").ToIPNet(),
+							NodeIF:   "eth0",
+						},
+					},
+				},
 			},
 			[]*v1core.Service{
 				{
@@ -239,7 +290,15 @@ func Test_advertiseExternalIPs(t *testing.T) {
 		{
 			"add bgp path for services with external IPs of type ClusterIP/NodePort/LoadBalancer",
 			&NetworkRoutingController{
-				bgpServer: gobgp.NewBgpServer(),
+				Controller: controllers.Controller{
+					Config: &options.KubeRouterConfig{
+						NodeInfo: options.NodeInfo{
+							NodeName: "",
+							NodeIP:   hostnet.NewIP("192.168.1.1").ToIPNet(),
+							NodeIF:   "eth0",
+						},
+					},
+				},
 			},
 			[]*v1core.Service{
 				{
@@ -284,7 +343,15 @@ func Test_advertiseExternalIPs(t *testing.T) {
 		{
 			"add bgp path for invalid service type",
 			&NetworkRoutingController{
-				bgpServer: gobgp.NewBgpServer(),
+				Controller: controllers.Controller{
+					Config: &options.KubeRouterConfig{
+						NodeInfo: options.NodeInfo{
+							NodeName: "",
+							NodeIP:   hostnet.NewIP("192.168.1.1").ToIPNet(),
+							NodeIF:   "eth0",
+						},
+					},
+				},
 			},
 			[]*v1core.Service{
 				{
@@ -315,7 +382,15 @@ func Test_advertiseExternalIPs(t *testing.T) {
 		{
 			"add bgp path for headless service",
 			&NetworkRoutingController{
-				bgpServer: gobgp.NewBgpServer(),
+				Controller: controllers.Controller{
+					Config: &options.KubeRouterConfig{
+						NodeInfo: options.NodeInfo{
+							NodeName: "",
+							NodeIP:   hostnet.NewIP("192.168.1.1").ToIPNet(),
+							NodeIF:   "eth0",
+						},
+					},
+				},
 			},
 			[]*v1core.Service{
 				{
@@ -356,7 +431,15 @@ func Test_advertiseExternalIPs(t *testing.T) {
 		{
 			"skip bgp path to loadbalancerIP for service without LoadBalancer IP",
 			&NetworkRoutingController{
-				bgpServer: gobgp.NewBgpServer(),
+				Controller: controllers.Controller{
+					Config: &options.KubeRouterConfig{
+						NodeInfo: options.NodeInfo{
+							NodeName: "",
+							NodeIP:   hostnet.NewIP("192.168.1.1").ToIPNet(),
+							NodeIF:   "eth0",
+						},
+					},
+				},
 			},
 			[]*v1core.Service{
 				{
@@ -383,7 +466,15 @@ func Test_advertiseExternalIPs(t *testing.T) {
 		{
 			"add bgp path to loadbalancerIP for service with LoadBalancer IP",
 			&NetworkRoutingController{
-				bgpServer: gobgp.NewBgpServer(),
+				Controller: controllers.Controller{
+					Config: &options.KubeRouterConfig{
+						NodeInfo: options.NodeInfo{
+							NodeName: "",
+							NodeIP:   hostnet.NewIP("192.168.1.1").ToIPNet(),
+							NodeIF:   "eth0",
+						},
+					},
+				},
 			},
 			[]*v1core.Service{
 				{
@@ -416,7 +507,15 @@ func Test_advertiseExternalIPs(t *testing.T) {
 		{
 			"no bgp path to nil loadbalancerIPs for service with LoadBalancer",
 			&NetworkRoutingController{
-				bgpServer: gobgp.NewBgpServer(),
+				Controller: controllers.Controller{
+					Config: &options.KubeRouterConfig{
+						NodeInfo: options.NodeInfo{
+							NodeName: "",
+							NodeIP:   hostnet.NewIP("192.168.1.1").ToIPNet(),
+							NodeIF:   "eth0",
+						},
+					},
+				},
 			},
 			[]*v1core.Service{
 				{
@@ -439,7 +538,15 @@ func Test_advertiseExternalIPs(t *testing.T) {
 		{
 			"no bgp path to loadbalancerIPs for service with LoadBalancer and skiplbips annotation",
 			&NetworkRoutingController{
-				bgpServer: gobgp.NewBgpServer(),
+				Controller: controllers.Controller{
+					Config: &options.KubeRouterConfig{
+						NodeInfo: options.NodeInfo{
+							NodeName: "",
+							NodeIP:   hostnet.NewIP("192.168.1.1").ToIPNet(),
+							NodeIF:   "eth0",
+						},
+					},
+				},
 			},
 			[]*v1core.Service{
 				{
@@ -472,19 +579,21 @@ func Test_advertiseExternalIPs(t *testing.T) {
 	}
 
 	for _, testcase := range testcases {
+		port++
 		t.Run(testcase.name, func(t *testing.T) {
+			testcase.nrc.Init("Network route controller", 15*time.Second, testcase.nrc.GetConfig(), testcase.nrc.run)
+			testcase.nrc.bgpServer = gobgp.NewBgpServer()
 			go testcase.nrc.bgpServer.Serve()
 			err := testcase.nrc.bgpServer.Start(&config.Global{
 				Config: config.GlobalConfig{
 					As:       1,
 					RouterId: "10.0.0.0",
-					Port:     10000,
+					Port:     port,
 				},
 			})
 			if err != nil {
 				t.Fatalf("failed to start BGP server: %v", err)
 			}
-			defer testcase.nrc.bgpServer.Stop()
 			w := testcase.nrc.bgpServer.Watch(gobgp.WatchBestPath(false))
 
 			clientset := fake.NewSimpleClientset()
@@ -498,9 +607,9 @@ func Test_advertiseExternalIPs(t *testing.T) {
 			waitForListerWithTimeout(testcase.nrc.svcLister, time.Second*10, t)
 
 			// ExternalIPs
-			testcase.nrc.advertiseClusterIP = false
-			testcase.nrc.advertiseExternalIP = true
-			testcase.nrc.advertiseLoadBalancerIP = true
+			testcase.nrc.GetConfig().AdvertiseClusterIp = false
+			testcase.nrc.GetConfig().AdvertiseExternalIp = true
+			testcase.nrc.GetConfig().AdvertiseLoadBalancerIp = true
 
 			toAdvertise, toWithdraw, _ := testcase.nrc.getActiveVIPs()
 			testcase.nrc.advertiseVIPs(toAdvertise)
@@ -531,6 +640,15 @@ func Test_advertiseAnnotationOptOut(t *testing.T) {
 		{
 			"add bgp paths for all service IPs",
 			&NetworkRoutingController{
+				Controller: controllers.Controller{
+					Config: &options.KubeRouterConfig{
+						NodeInfo: options.NodeInfo{
+							NodeName: "",
+							NodeIP:   hostnet.NewIP("192.168.1.1").ToIPNet(),
+							NodeIF:   "eth0",
+						},
+					},
+				},
 				bgpServer: gobgp.NewBgpServer(),
 			},
 			[]*v1core.Service{
@@ -593,6 +711,15 @@ func Test_advertiseAnnotationOptOut(t *testing.T) {
 		{
 			"opt out to advertise any IPs via annotations",
 			&NetworkRoutingController{
+				Controller: controllers.Controller{
+					Config: &options.KubeRouterConfig{
+						NodeInfo: options.NodeInfo{
+							NodeName: "",
+							NodeIP:   hostnet.NewIP("192.168.1.1").ToIPNet(),
+							NodeIF:   "eth0",
+						},
+					},
+				},
 				bgpServer: gobgp.NewBgpServer(),
 			},
 			[]*v1core.Service{
@@ -629,19 +756,19 @@ func Test_advertiseAnnotationOptOut(t *testing.T) {
 	}
 
 	for _, testcase := range testcases {
+		port++
 		t.Run(testcase.name, func(t *testing.T) {
 			go testcase.nrc.bgpServer.Serve()
 			err := testcase.nrc.bgpServer.Start(&config.Global{
 				Config: config.GlobalConfig{
 					As:       1,
 					RouterId: "10.0.0.0",
-					Port:     10000,
+					Port:     port,
 				},
 			})
 			if err != nil {
 				t.Fatalf("failed to start BGP server: %v", err)
 			}
-			defer testcase.nrc.bgpServer.Stop()
 			w := testcase.nrc.bgpServer.Watch(gobgp.WatchBestPath(false))
 
 			clientset := fake.NewSimpleClientset()
@@ -655,9 +782,9 @@ func Test_advertiseAnnotationOptOut(t *testing.T) {
 			waitForListerWithTimeout(testcase.nrc.svcLister, time.Second*10, t)
 
 			// By default advertise all IPs
-			testcase.nrc.advertiseClusterIP = true
-			testcase.nrc.advertiseExternalIP = true
-			testcase.nrc.advertiseLoadBalancerIP = true
+			testcase.nrc.GetConfig().AdvertiseClusterIp = true
+			testcase.nrc.GetConfig().AdvertiseExternalIp = true
+			testcase.nrc.GetConfig().AdvertiseLoadBalancerIp = true
 
 			toAdvertise, toWithdraw, _ := testcase.nrc.getActiveVIPs()
 			testcase.nrc.advertiseVIPs(toAdvertise)
@@ -673,8 +800,19 @@ func Test_advertiseAnnotationOptOut(t *testing.T) {
 					}
 				}
 			}
+			async_worker.GlobalManager.StopWorkerManager()
 		})
 	}
+}
+
+var Controller = controllers.Controller{
+	Config: &options.KubeRouterConfig{
+		NodeInfo: options.NodeInfo{
+			NodeName: "",
+			NodeIP:   hostnet.NewIP("192.168.1.1").ToIPNet(),
+			NodeIF:   "eth0",
+		},
+	},
 }
 
 func Test_advertiseAnnotationOptIn(t *testing.T) {
@@ -688,7 +826,8 @@ func Test_advertiseAnnotationOptIn(t *testing.T) {
 		{
 			"no bgp paths for any service IPs",
 			&NetworkRoutingController{
-				bgpServer: gobgp.NewBgpServer(),
+				Controller: Controller,
+				bgpServer:  gobgp.NewBgpServer(),
 			},
 			[]*v1core.Service{
 				{
@@ -741,7 +880,8 @@ func Test_advertiseAnnotationOptIn(t *testing.T) {
 		{
 			"opt in to advertise all IPs via annotations",
 			&NetworkRoutingController{
-				bgpServer: gobgp.NewBgpServer(),
+				Controller: Controller,
+				bgpServer:  gobgp.NewBgpServer(),
 			},
 			[]*v1core.Service{
 				{
@@ -818,19 +958,19 @@ func Test_advertiseAnnotationOptIn(t *testing.T) {
 	}
 
 	for _, testcase := range testcases {
+		port++
 		t.Run(testcase.name, func(t *testing.T) {
 			go testcase.nrc.bgpServer.Serve()
 			err := testcase.nrc.bgpServer.Start(&config.Global{
 				Config: config.GlobalConfig{
 					As:       1,
 					RouterId: "10.0.0.0",
-					Port:     10000,
+					Port:     port,
 				},
 			})
 			if err != nil {
 				t.Fatalf("failed to start BGP server: %v", err)
 			}
-			defer testcase.nrc.bgpServer.Stop()
 			w := testcase.nrc.bgpServer.Watch(gobgp.WatchBestPath(false))
 
 			clientset := fake.NewSimpleClientset()
@@ -844,9 +984,9 @@ func Test_advertiseAnnotationOptIn(t *testing.T) {
 			waitForListerWithTimeout(testcase.nrc.svcLister, time.Second*10, t)
 
 			// By default do not advertise any IPs
-			testcase.nrc.advertiseClusterIP = false
-			testcase.nrc.advertiseExternalIP = false
-			testcase.nrc.advertiseLoadBalancerIP = false
+			testcase.nrc.GetConfig().AdvertiseClusterIp = false
+			testcase.nrc.GetConfig().AdvertiseExternalIp = false
+			testcase.nrc.GetConfig().AdvertiseLoadBalancerIp = false
 
 			toAdvertise, toWithdraw, _ := testcase.nrc.getActiveVIPs()
 			testcase.nrc.advertiseVIPs(toAdvertise)
@@ -866,6 +1006,16 @@ func Test_advertiseAnnotationOptIn(t *testing.T) {
 	}
 }
 
+var ControllerNode1 = controllers.Controller{
+	Config: &options.KubeRouterConfig{
+		NodeInfo: options.NodeInfo{
+			NodeName: "node-1",
+			NodeIP:   hostnet.NewIP("192.168.1.1").ToIPNet(),
+			NodeIF:   "eth0",
+		},
+	},
+}
+
 func Test_nodeHasEndpointsForService(t *testing.T) {
 	testcases := []struct {
 		name             string
@@ -878,7 +1028,7 @@ func Test_nodeHasEndpointsForService(t *testing.T) {
 		{
 			"node has endpoints for service",
 			&NetworkRoutingController{
-				nodeName: "node-1",
+				Controller: ControllerNode1,
 			},
 			&v1core.Service{
 				ObjectMeta: metav1.ObjectMeta{
@@ -917,7 +1067,7 @@ func Test_nodeHasEndpointsForService(t *testing.T) {
 		{
 			"node has no endpoints for service",
 			&NetworkRoutingController{
-				nodeName: "node-1",
+				Controller: ControllerNode1,
 			},
 			&v1core.Service{
 				ObjectMeta: metav1.ObjectMeta{
@@ -1002,7 +1152,8 @@ func Test_advertisePodRoute(t *testing.T) {
 		{
 			"add bgp path for pod cidr using NODE_NAME",
 			&NetworkRoutingController{
-				bgpServer: gobgp.NewBgpServer(),
+				Controller: Controller,
+				bgpServer:  gobgp.NewBgpServer(),
 			},
 			"node-1",
 			&v1core.Node{
@@ -1011,6 +1162,11 @@ func Test_advertisePodRoute(t *testing.T) {
 				},
 				Spec: v1core.NodeSpec{
 					PodCIDR: "172.20.0.0/24",
+				},
+				Status: v1core.NodeStatus{
+					Addresses: []v1core.NodeAddress{
+						{Address: "192.168.1.1", Type: v1core.NodeInternalIP},
+					},
 				},
 			},
 			map[string]bool{
@@ -1021,8 +1177,12 @@ func Test_advertisePodRoute(t *testing.T) {
 		{
 			"add bgp path for pod cidr using hostname override",
 			&NetworkRoutingController{
-				bgpServer:        gobgp.NewBgpServer(),
-				hostnameOverride: "node-1",
+				bgpServer: gobgp.NewBgpServer(),
+				Controller: controllers.Controller{
+					Config: &options.KubeRouterConfig{
+						HostnameOverride: "node-1",
+					},
+				},
 			},
 			"",
 			&v1core.Node{
@@ -1031,6 +1191,11 @@ func Test_advertisePodRoute(t *testing.T) {
 				},
 				Spec: v1core.NodeSpec{
 					PodCIDR: "172.20.0.0/24",
+				},
+				Status: v1core.NodeStatus{
+					Addresses: []v1core.NodeAddress{
+						{Address: "192.168.1.1", Type: v1core.NodeInternalIP},
+					},
 				},
 			},
 			map[string]bool{
@@ -1041,6 +1206,9 @@ func Test_advertisePodRoute(t *testing.T) {
 		{
 			"add bgp path for pod cidr without NODE_NAME or hostname override",
 			&NetworkRoutingController{
+				Controller: controllers.Controller{
+					Config: &options.KubeRouterConfig{},
+				},
 				bgpServer: gobgp.NewBgpServer(),
 			},
 			"",
@@ -1051,14 +1219,20 @@ func Test_advertisePodRoute(t *testing.T) {
 				Spec: v1core.NodeSpec{
 					PodCIDR: "172.20.0.0/24",
 				},
+				Status: v1core.NodeStatus{
+					Addresses: []v1core.NodeAddress{
+						{Address: "192.168.1.1", Type: v1core.NodeInternalIP},
+					},
+				},
 			},
 			map[string]bool{},
-			errors.New("Failed to get pod CIDR allocated for the node due to: Failed to identify the node by NODE_NAME, hostname or --hostname-override"),
+			errors.New("Failed getting node object from API server: Failed to identify the node by NODE_NAME, hostname or --hostname-override [@options.go:212]"),
 		},
 		{
 			"node does not have pod cidr set",
 			&NetworkRoutingController{
-				bgpServer: gobgp.NewBgpServer(),
+				Controller: Controller,
+				bgpServer:  gobgp.NewBgpServer(),
 			},
 			"node-1",
 			&v1core.Node{
@@ -1068,6 +1242,11 @@ func Test_advertisePodRoute(t *testing.T) {
 				Spec: v1core.NodeSpec{
 					PodCIDR: "",
 				},
+				Status: v1core.NodeStatus{
+					Addresses: []v1core.NodeAddress{
+						{Address: "192.168.1.1", Type: v1core.NodeInternalIP},
+					},
+				},
 			},
 			map[string]bool{},
 			errors.New("node.Spec.PodCIDR not set for node: node-1"),
@@ -1075,19 +1254,19 @@ func Test_advertisePodRoute(t *testing.T) {
 	}
 
 	for _, testcase := range testcases {
+		port++
 		t.Run(testcase.name, func(t *testing.T) {
 			go testcase.nrc.bgpServer.Serve()
 			err := testcase.nrc.bgpServer.Start(&config.Global{
 				Config: config.GlobalConfig{
 					As:       1,
 					RouterId: "10.0.0.0",
-					Port:     10000,
+					Port:     port,
 				},
 			})
 			if err != nil {
 				t.Fatalf("failed to start BGP server: %v", err)
 			}
-			defer testcase.nrc.bgpServer.Stop()
 			w := testcase.nrc.bgpServer.Watch(gobgp.WatchBestPath(false))
 
 			clientset := fake.NewSimpleClientset()
@@ -1095,10 +1274,19 @@ func Test_advertisePodRoute(t *testing.T) {
 			if err != nil {
 				t.Fatalf("failed to create node: %v", err)
 			}
-			testcase.nrc.clientset = clientset
+			testcase.nrc.GetConfig().ClientSet = clientset
 
 			os.Setenv("NODE_NAME", testcase.envNodeName)
 			defer os.Unsetenv("NODE_NAME")
+			err = testcase.nrc.GetConfig().InitCommons(testcase.nrc.GetConfig())
+			if err != nil {
+				if !reflect.DeepEqual(err, testcase.err) {
+					t.Logf("actual error: %v", err)
+					t.Logf("expected error: %v", testcase.err)
+					t.Error("did not get expected error")
+				}
+				return
+			}
 
 			err = testcase.nrc.advertisePodRoute()
 			if !reflect.DeepEqual(err, testcase.err) {
@@ -1131,11 +1319,18 @@ func Test_syncInternalPeers(t *testing.T) {
 		{
 			"sync 1 peer",
 			&NetworkRoutingController{
-				bgpFullMeshMode: true,
-				clientset:       fake.NewSimpleClientset(),
-				nodeIP:          net.ParseIP("10.0.0.0"),
-				bgpServer:       gobgp.NewBgpServer(),
-				activeNodes:     make(map[string]bool),
+				Controller: controllers.Controller{
+					Config: &options.KubeRouterConfig{
+						NodeInfo: options.NodeInfo{
+							NodeName: "node-test",
+							NodeIP:   hostnet.NewIP("192.168.100.1").ToIPNet(),
+							NodeIF:   "eth0",
+						},
+						FullMeshMode: true,
+						ClientSet:    fake.NewSimpleClientset(),
+					},
+				},
+				bgpServer: gobgp.NewBgpServer(),
 			},
 			[]*v1core.Node{
 				{
@@ -1159,11 +1354,18 @@ func Test_syncInternalPeers(t *testing.T) {
 		{
 			"sync multiple peers",
 			&NetworkRoutingController{
-				bgpFullMeshMode: true,
-				clientset:       fake.NewSimpleClientset(),
-				nodeIP:          net.ParseIP("10.0.0.0"),
-				bgpServer:       gobgp.NewBgpServer(),
-				activeNodes:     make(map[string]bool),
+				Controller: controllers.Controller{
+					Config: &options.KubeRouterConfig{
+						NodeInfo: options.NodeInfo{
+							NodeName: "node-test",
+							NodeIP:   hostnet.NewIP("192.168.1.1").ToIPNet(),
+							NodeIF:   "eth0",
+						},
+						FullMeshMode: true,
+						ClientSet:    fake.NewSimpleClientset(),
+					},
+				},
+				bgpServer: gobgp.NewBgpServer(),
 			},
 			[]*v1core.Node{
 				{
@@ -1201,13 +1403,21 @@ func Test_syncInternalPeers(t *testing.T) {
 		{
 			"sync peer with removed nodes",
 			&NetworkRoutingController{
-				bgpFullMeshMode: true,
-				clientset:       fake.NewSimpleClientset(),
-				nodeIP:          net.ParseIP("10.0.0.0"),
-				bgpServer:       gobgp.NewBgpServer(),
-				activeNodes: map[string]bool{
-					"10.0.0.2": true,
+				Controller: controllers.Controller{
+					Config: &options.KubeRouterConfig{
+						FullMeshMode: true,
+						ClientSet:    fake.NewSimpleClientset(),
+						NodeInfo: options.NodeInfo{
+							NodeName: "node-test",
+							NodeIP:   hostnet.NewIP("10.0.0.0").ToIPNet(),
+							NodeIF:   "eth0",
+						},
+					},
 				},
+				bgpServer: gobgp.NewBgpServer(),
+				activeNodes: getSyncMap(map[string]bool{
+					"10.0.0.2": true,
+				}),
 			},
 			[]*v1core.Node{
 				{
@@ -1231,12 +1441,19 @@ func Test_syncInternalPeers(t *testing.T) {
 		{
 			"sync multiple peers with full mesh disabled",
 			&NetworkRoutingController{
-				bgpFullMeshMode: false,
-				clientset:       fake.NewSimpleClientset(),
-				nodeIP:          net.ParseIP("10.0.0.0"),
-				bgpServer:       gobgp.NewBgpServer(),
-				activeNodes:     make(map[string]bool),
-				nodeAsnNumber:   100,
+				Controller: controllers.Controller{
+					Config: &options.KubeRouterConfig{
+						FullMeshMode: false,
+						ClientSet:    fake.NewSimpleClientset(),
+						NodeInfo: options.NodeInfo{
+							NodeName: "node-test",
+							NodeIP:   hostnet.NewIP("10.0.0.0").ToIPNet(),
+							NodeIF:   "eth0",
+						},
+					},
+				},
+				bgpServer:     gobgp.NewBgpServer(),
+				nodeAsnNumber: 100,
 			},
 			[]*v1core.Node{
 				{
@@ -1276,24 +1493,26 @@ func Test_syncInternalPeers(t *testing.T) {
 	}
 
 	for _, testcase := range testcases {
+		port++
 		t.Run(testcase.name, func(t *testing.T) {
 			go testcase.nrc.bgpServer.Serve()
 			err := testcase.nrc.bgpServer.Start(&config.Global{
 				Config: config.GlobalConfig{
 					As:       1,
 					RouterId: "10.0.0.0",
-					Port:     10000,
+					Port:     port,
 				},
 			})
 			if err != nil {
 				t.Fatalf("failed to start BGP server: %v", err)
 			}
-			defer testcase.nrc.bgpServer.Stop()
 
-			if err = createNodes(testcase.nrc.clientset, testcase.existingNodes); err != nil {
+			if err = createNodes(testcase.nrc.GetConfig().ClientSet, testcase.existingNodes); err != nil {
 				t.Errorf("failed to create existing nodes: %v", err)
 			}
 
+			startInformersForRoutes(testcase.nrc, testcase.nrc.GetConfig().ClientSet)
+			waitForListerWithTimeout(testcase.nrc.nodeLister, time.Second*10, t)
 			testcase.nrc.syncInternalPeers()
 
 			neighbors := testcase.nrc.bgpServer.GetNeighbor("", false)
@@ -1304,7 +1523,12 @@ func Test_syncInternalPeers(t *testing.T) {
 				}
 			}
 
-			if !reflect.DeepEqual(testcase.nrc.activeNodes, testcase.neighbors) {
+			activeNodes := make(map[string]bool)
+			testcase.nrc.activeNodes.Range(func(key, value interface{}) bool {
+				activeNodes[key.(string)] = true
+				return true
+			})
+			if !reflect.DeepEqual(activeNodes, testcase.neighbors) {
 				t.Logf("actual active nodes: %v", testcase.nrc.activeNodes)
 				t.Logf("expected active nodes: %v", testcase.neighbors)
 				t.Errorf("did not get expected activeNodes")
@@ -1501,13 +1725,19 @@ func Test_AddPolicies(t *testing.T) {
 		{
 			"has nodes and services",
 			&NetworkRoutingController{
-				clientset:         fake.NewSimpleClientset(),
-				hostnameOverride:  "node-1",
-				bgpFullMeshMode:   false,
-				bgpEnableInternal: true,
-				bgpServer:         gobgp.NewBgpServer(),
-				activeNodes:       make(map[string]bool),
-				nodeAsnNumber:     100,
+				Controller: controllers.Controller{
+					Config: &options.KubeRouterConfig{
+						FullMeshMode:     false,
+						EnableiBGP:       true,
+						HostnameOverride: "node-1",
+						ClientSet:        fake.NewSimpleClientset(),
+						NodeInfo: options.NodeInfo{
+							NodeIP: hostnet.NewIP("10.0.0.1").ToIPNet(),
+						},
+					},
+				},
+				bgpServer:     gobgp.NewBgpServer(),
+				nodeAsnNumber: 100,
 			},
 			[]*v1core.Node{
 				{
@@ -1631,12 +1861,19 @@ func Test_AddPolicies(t *testing.T) {
 		{
 			"has nodes, services with external peers",
 			&NetworkRoutingController{
-				clientset:         fake.NewSimpleClientset(),
-				hostnameOverride:  "node-1",
-				bgpFullMeshMode:   false,
-				bgpEnableInternal: true,
-				bgpServer:         gobgp.NewBgpServer(),
-				activeNodes:       make(map[string]bool),
+				Controller: controllers.Controller{
+					Config: &options.KubeRouterConfig{
+						FullMeshMode:     false,
+						EnableiBGP:       true,
+						HostnameOverride: "node-1",
+						ClientSet:        fake.NewSimpleClientset(),
+						NodeInfo: options.NodeInfo{
+							NodeIP: hostnet.NewIP("10.0.0.0").ToIPNet(),
+						},
+					},
+				},
+				bgpServer:     gobgp.NewBgpServer(),
+				nodeAsnNumber: 100,
 				globalPeerRouters: []*config.Neighbor{
 					{
 						Config: config.NeighborConfig{NeighborAddress: "10.10.0.1"},
@@ -1645,7 +1882,6 @@ func Test_AddPolicies(t *testing.T) {
 						Config: config.NeighborConfig{NeighborAddress: "10.10.0.2"},
 					},
 				},
-				nodeAsnNumber: 100,
 			},
 			[]*v1core.Node{
 				{
@@ -1795,12 +2031,19 @@ func Test_AddPolicies(t *testing.T) {
 		{
 			"has nodes, services with external peers and iBGP disabled",
 			&NetworkRoutingController{
-				clientset:         fake.NewSimpleClientset(),
-				hostnameOverride:  "node-1",
-				bgpFullMeshMode:   false,
-				bgpEnableInternal: false,
-				bgpServer:         gobgp.NewBgpServer(),
-				activeNodes:       make(map[string]bool),
+				Controller: controllers.Controller{
+					Config: &options.KubeRouterConfig{
+						FullMeshMode:     false,
+						EnableiBGP:       false,
+						HostnameOverride: "node-1",
+						ClientSet:        fake.NewSimpleClientset(),
+						NodeInfo: options.NodeInfo{
+							NodeIP: hostnet.NewIP("10.0.0.1").ToIPNet(),
+						},
+					},
+				},
+				bgpServer:     gobgp.NewBgpServer(),
+				nodeAsnNumber: 100,
 				globalPeerRouters: []*config.Neighbor{
 					{
 						Config: config.NeighborConfig{NeighborAddress: "10.10.0.1"},
@@ -1809,7 +2052,6 @@ func Test_AddPolicies(t *testing.T) {
 						Config: config.NeighborConfig{NeighborAddress: "10.10.0.2"},
 					},
 				},
-				nodeAsnNumber: 100,
 			},
 			[]*v1core.Node{
 				{
@@ -1943,15 +2185,22 @@ func Test_AddPolicies(t *testing.T) {
 		{
 			"prepends AS with external peers",
 			&NetworkRoutingController{
-				clientset:         fake.NewSimpleClientset(),
-				hostnameOverride:  "node-1",
-				bgpEnableInternal: true,
-				bgpFullMeshMode:   false,
-				pathPrepend:       true,
-				pathPrependCount:  5,
-				pathPrependAS:     "65100",
-				bgpServer:         gobgp.NewBgpServer(),
-				activeNodes:       make(map[string]bool),
+				Controller: controllers.Controller{
+					Config: &options.KubeRouterConfig{
+						FullMeshMode:     false,
+						EnableiBGP:       true,
+						HostnameOverride: "node-1",
+						ClientSet:        fake.NewSimpleClientset(),
+						NodeInfo: options.NodeInfo{
+							NodeIP: hostnet.NewIP("10.0.0.0").ToIPNet(),
+						},
+					},
+				},
+				pathPrepend:      true,
+				pathPrependCount: 5,
+				pathPrependAS:    "65100",
+				bgpServer:        gobgp.NewBgpServer(),
+				nodeAsnNumber:    100,
 				globalPeerRouters: []*config.Neighbor{
 					{
 						Config: config.NeighborConfig{NeighborAddress: "10.10.0.1"},
@@ -1960,7 +2209,6 @@ func Test_AddPolicies(t *testing.T) {
 						Config: config.NeighborConfig{NeighborAddress: "10.10.0.2"},
 					},
 				},
-				nodeAsnNumber: 100,
 			},
 			[]*v1core.Node{
 				{
@@ -2116,14 +2364,18 @@ func Test_AddPolicies(t *testing.T) {
 		{
 			"only prepends AS when both node annotations are present",
 			&NetworkRoutingController{
-				clientset:         fake.NewSimpleClientset(),
-				hostnameOverride:  "node-1",
-				bgpEnableInternal: true,
-				bgpFullMeshMode:   false,
-				pathPrepend:       false,
-				pathPrependAS:     "65100",
-				bgpServer:         gobgp.NewBgpServer(),
-				activeNodes:       make(map[string]bool),
+				Controller: controllers.Controller{
+					Config: &options.KubeRouterConfig{
+						FullMeshMode:     false,
+						EnableiBGP:       true,
+						HostnameOverride: "node-1",
+						ClientSet:        fake.NewSimpleClientset(),
+					},
+				},
+				pathPrepend:   false,
+				pathPrependAS: "65100",
+				bgpServer:     gobgp.NewBgpServer(),
+				nodeAsnNumber: 100,
 				globalPeerRouters: []*config.Neighbor{
 					{
 						Config: config.NeighborConfig{NeighborAddress: "10.10.0.1"},
@@ -2132,7 +2384,6 @@ func Test_AddPolicies(t *testing.T) {
 						Config: config.NeighborConfig{NeighborAddress: "10.10.0.2"},
 					},
 				},
-				nodeAsnNumber: 100,
 			},
 			[]*v1core.Node{
 				{
@@ -2282,38 +2533,38 @@ func Test_AddPolicies(t *testing.T) {
 	}
 
 	for _, testcase := range testcases {
+		port++
 		t.Run(testcase.name, func(t *testing.T) {
 			go testcase.nrc.bgpServer.Serve()
 			err := testcase.nrc.bgpServer.Start(&config.Global{
 				Config: config.GlobalConfig{
 					As:       1,
 					RouterId: "10.0.0.0",
-					Port:     10000,
+					Port:     port,
 				},
 			})
 			if err != nil {
 				t.Fatalf("failed to start BGP server: %v", err)
 			}
-			defer testcase.nrc.bgpServer.Stop()
 
-			startInformersForRoutes(testcase.nrc, testcase.nrc.clientset)
+			startInformersForRoutes(testcase.nrc, testcase.nrc.GetConfig().ClientSet)
 
-			if err = createNodes(testcase.nrc.clientset, testcase.existingNodes); err != nil {
+			if err = createNodes(testcase.nrc.GetConfig().ClientSet, testcase.existingNodes); err != nil {
 				t.Errorf("failed to create existing nodes: %v", err)
 			}
 
-			if err = createServices(testcase.nrc.clientset, testcase.existingServices); err != nil {
+			if err = createServices(testcase.nrc.GetConfig().ClientSet, testcase.existingServices); err != nil {
 				t.Errorf("failed to create existing nodes: %v", err)
 			}
 
 			// ClusterIPs and ExternalIPs
 			waitForListerWithTimeout(testcase.nrc.svcLister, time.Second*10, t)
 
-			testcase.nrc.advertiseClusterIP = true
-			testcase.nrc.advertiseExternalIP = true
-			testcase.nrc.advertiseLoadBalancerIP = false
+			testcase.nrc.GetConfig().AdvertiseClusterIp = true
+			testcase.nrc.GetConfig().AdvertiseExternalIp = true
+			testcase.nrc.GetConfig().AdvertiseLoadBalancerIp = false
 
-			informerFactory := informers.NewSharedInformerFactory(testcase.nrc.clientset, 0)
+			informerFactory := informers.NewSharedInformerFactory(testcase.nrc.GetConfig().ClientSet, 0)
 			nodeInformer := informerFactory.Core().V1().Nodes().Informer()
 			testcase.nrc.nodeLister = nodeInformer.GetIndexer()
 			err = testcase.nrc.AddPolicies()
@@ -2477,16 +2728,18 @@ func startInformersForRoutes(nrc *NetworkRoutingController, clientset kubernetes
 	informerFactory := informers.NewSharedInformerFactory(clientset, 0)
 	svcInformer := informerFactory.Core().V1().Services().Informer()
 	epInformer := informerFactory.Core().V1().Endpoints().Informer()
+	nodeInformer := informerFactory.Core().V1().Nodes().Informer()
 
 	go informerFactory.Start(nil)
 	informerFactory.WaitForCacheSync(nil)
 
 	nrc.svcLister = svcInformer.GetIndexer()
 	nrc.epLister = epInformer.GetIndexer()
+	nrc.nodeLister = nodeInformer.GetIndexer()
 }
 
 func waitForListerWithTimeout(lister cache.Indexer, timeout time.Duration, t *testing.T) {
-	tick := time.Tick(100 * time.Millisecond)
+	tick := time.Tick(1000 * time.Millisecond)
 	timeoutCh := time.After(timeout)
 	for {
 		select {
@@ -2519,4 +2772,11 @@ func waitForBGPWatchEventWithTimeout(timeout time.Duration, expectedNumEvents in
 
 func ptrToString(str string) *string {
 	return &str
+}
+
+func getSyncMap(content map[string]bool) (smp sync.Map) {
+	for k, v := range content {
+		smp.Store(k, v)
+	}
+	return
 }

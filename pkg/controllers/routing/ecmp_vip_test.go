@@ -3,6 +3,7 @@ package routing
 import (
 	"testing"
 
+	"github.com/cloudnativelabs/kube-router/pkg/options"
 	v1core "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
@@ -349,10 +350,12 @@ func Test_getVIPsForService(t *testing.T) {
 
 	for _, test := range tests {
 		nrc := NetworkRoutingController{}
+		config := options.KubeRouterConfig{}
+		nrc.Init("Network route controller", 0, &config, nrc.run)
 		t.Run(test.name, func(t *testing.T) {
-			nrc.advertiseClusterIP = test.advertiseSettings[0]
-			nrc.advertiseExternalIP = test.advertiseSettings[1]
-			nrc.advertiseLoadBalancerIP = test.advertiseSettings[2]
+			nrc.GetConfig().AdvertiseClusterIp = test.advertiseSettings[0]
+			nrc.GetConfig().AdvertiseExternalIp = test.advertiseSettings[1]
+			nrc.GetConfig().AdvertiseLoadBalancerIp = test.advertiseSettings[2]
 
 			for _, serviceAdvertisedIP := range test.serviceAdvertisedIPs {
 				clientset := fake.NewSimpleClientset()
