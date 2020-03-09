@@ -295,7 +295,7 @@ func (nrc *NetworkRoutingController) updateCNIConfig() {
 	}
 
 	// calculate with worst case subnet=full
-	err = api.UpdateCNIWithValues(nrc.cniConfFile, options.KUBE_BRIDGE_IF, api.UpdateMtu, hostnet.GetInterfaceMTU(nrc.GetNodeIF())-48)
+	err = api.UpdateCNIWithValues(nrc.cniConfFile, options.KUBE_BRIDGE_IF, api.UpdateMtu, hostnet.GetInterfaceMTU(nrc.GetConfig().GetNodeIF())-48)
 	if err != nil {
 		glog.Fatalf("Failed to insert `MTU` into CNI conf file: %s", err.Error())
 	}
@@ -349,8 +349,8 @@ func (nrc *NetworkRoutingController) advertisePodRoute() error {
 
 	cidr := hostnet.NewIP(scidr)
 
-	glog.V(2).Infof("Advertising route: '%s via %s' to peers", cidr.ToCIDR(), nrc.GetNodeIP().IP.String())
-	_, err = nrc.bgpServer.AddPath("", []*table.Path{table.NewPath(nil, cidr.ToBgpPrefix(), false, getPathAttributes(cidr, hostnet.NewIP(nrc.GetNodeIP())), time.Now(), false)})
+	glog.V(2).Infof("Advertising route: '%s via %s' to peers", cidr.ToCIDR(), nrc.GetConfig().GetNodeIP().IP.String())
+	_, err = nrc.bgpServer.AddPath("", []*table.Path{table.NewPath(nil, cidr.ToBgpPrefix(), false, getPathAttributes(cidr, hostnet.NewIP(nrc.GetConfig().GetNodeIP())), time.Now(), false)})
 	return err
 }
 
@@ -452,7 +452,7 @@ func (nrc *NetworkRoutingController) syncNodeIPSets() error {
 		glog.V(2).Infof("Sync nodeIpSets in network routing controller took %v", time.Since(start))
 	}()
 	// Get the current list of the nodes from API server
-	nodes := api.GetAllClusterNodes(nrc.nodeLister)
+	nodes := api.GetAllClusterNodes(nrc.GetConfig().ClientSet)
 
 	// Collect active PodCIDR(s) and NodeIPs from nodes
 	currentPodCidrs := make([]string, 0)
@@ -510,7 +510,7 @@ func (nrc *NetworkRoutingController) enableIptables(initial hostnet.IpTableManip
 		}
 	}
 
-	if !hostnet.NewIP(nrc.GetNodeIP()).IsIPv4() {
+	if !hostnet.NewIP(nrc.GetConfig().GetNodeIP()).IsIPv4() {
 		if err = nrc.EnableBgpSNAT(initial); err != nil {
 			fmt.Errorf("Failed to setup SNAT for bgp %s", err)
 		}
@@ -548,7 +548,7 @@ func (nrc *NetworkRoutingController) _enableForwarding(p hostnet.Proto) error {
 	rules.Add(hostnet.NewRule(args...))
 
 	comment = "allow outbound node port traffic on node interface with which node ip is associated"
-	args = []string{"-m", "comment", "--comment", comment, "-o", nrc.GetNodeIF(), "-j", "ACCEPT"}
+	args = []string{"-m", "comment", "--comment", comment, "-o", nrc.GetConfig().GetNodeIF(), "-j", "ACCEPT"}
 	rules.Add(hostnet.NewRule(args...))
 
 	return nrc.Ipm.CreateRuleChain(p, "filter", hostnet.CHAIN_KUBE_COMMON_FORWARD, hostnet.IPTABLES_APPEND_UNIQUE,
@@ -619,8 +619,8 @@ func (nrc *NetworkRoutingController) startBgpServer() error {
 		nrc.pathPrependCount = uint8(repeatN)
 	}
 
-	if !tools.CheckForElementInArray(nrc.GetNodeIP().IP.String(), nrc.localAddressList) {
-		nrc.localAddressList = append(nrc.localAddressList, nrc.GetNodeIP().IP.String())
+	if !tools.CheckForElementInArray(nrc.GetConfig().GetNodeIP().IP.String(), nrc.localAddressList) {
+		nrc.localAddressList = append(nrc.localAddressList, nrc.GetConfig().GetNodeIP().IP.String())
 	}
 
 	nrc.bgpServer = gobgp.NewBgpServer()
@@ -755,13 +755,13 @@ func NewNetworkRoutingController(kubeRouterConfig *options.KubeRouterConfig,
 	nrc.initSrcDstCheckDone = false
 
 	var node *v1.Node
-	if nrc.nodeInterfaceMAC = hostnet.GetInterfaceMACAddress(nrc.GetNodeIF()); nrc.nodeInterfaceMAC != "" {
-		node = api.AnnotateNode(nrc.GetConfig().ClientSet, nrc.GetNode(), nodeMACAnnotation, nrc.nodeInterfaceMAC)
+	if nrc.nodeInterfaceMAC = hostnet.GetInterfaceMACAddress(nrc.GetConfig().GetNodeIF()); nrc.nodeInterfaceMAC != "" {
+		node = api.AnnotateNode(nrc.GetConfig().ClientSet, nrc.GetConfig().GetNode(), nodeMACAnnotation, nrc.nodeInterfaceMAC)
 	}
 
 	bgpLocalAddressListAnnotation, _ := node.ObjectMeta.Annotations[routerID]
-	if "" == nrc.setRouterId(bgpLocalAddressListAnnotation, kubeRouterConfig.RouterId, nrc.GetNodeIP().IP.String(), fmt.Sprint(nrc.GetNodeIP().IP[12:])) {
-		if !hostnet.NewIP(nrc.GetNodeIP()).IsIPv4() {
+	if "" == nrc.setRouterId(bgpLocalAddressListAnnotation, kubeRouterConfig.RouterId, nrc.GetConfig().GetNodeIP().IP.String(), fmt.Sprint(nrc.GetConfig().GetNodeIP().IP[12:])) {
+		if !hostnet.NewIP(nrc.GetConfig().GetNodeIP()).IsIPv4() {
 			glog.Error("Router-id must be specified in ipv6 operation")
 			return nil
 		}
@@ -839,8 +839,8 @@ func NewNetworkRoutingController(kubeRouterConfig *options.KubeRouterConfig,
 
 	bgpLocalAddressListAnnotation, ok := node.ObjectMeta.Annotations[bgpLocalAddressAnnotation]
 	if !ok {
-		glog.Infof("Could not find annotation `kube-router.io/bgp-local-addresses` on node object so BGP will listen on node IP: %s address.", nrc.GetNodeIP().IP.String())
-		nrc.localAddressList = append(nrc.localAddressList, nrc.GetNodeIP().IP.String())
+		glog.Infof("Could not find annotation `kube-router.io/bgp-local-addresses` on node object so BGP will listen on node IP: %s address.", nrc.GetConfig().GetNodeIP().IP.String())
+		nrc.localAddressList = append(nrc.localAddressList, nrc.GetConfig().GetNodeIP().IP.String())
 	} else {
 		glog.Infof("Found annotation `kube-router.io/bgp-local-addresses` on node object so BGP will listen on local IP's: %s", bgpLocalAddressListAnnotation)
 		localAddresses := stringToSlice(bgpLocalAddressListAnnotation, ",")
@@ -864,7 +864,7 @@ func NewNetworkRoutingController(kubeRouterConfig *options.KubeRouterConfig,
 	nrc.NodeEventHandler = nrc.newNodeEventHandler()
 	nodeInformer.AddEventHandler(nrc.NodeEventHandler)
 
-	nrc.Ipm = hostnet.NewIpTablesManager(nrc.GetNodeIP().IP, podEgressObsoleteChains)
+	nrc.Ipm = hostnet.NewIpTablesManager(nrc.GetConfig().GetNodeIP().IP, podEgressObsoleteChains)
 	nrc.Ipm.RegisterPeriodicFunction(hostnet.CreateSnats)
 
 	return &nrc

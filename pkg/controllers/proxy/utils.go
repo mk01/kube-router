@@ -393,7 +393,7 @@ func (ks *KubeService) purgeDestination(ep *endpointInfo) (err error) {
 		glog.Errorf("Can't remove destination due to: %s", err.Error())
 		return
 	}
-	glog.V(1).Infof("Successfully removed destination %s from the service %s", ep, ks)
+	glog.V(1).Infof("Successfully removed destination %s from the service %s", ep.String(1), ks.String())
 
 	var so = ep.so
 	var count = ep.Unlock(ks.getHash())
@@ -411,9 +411,9 @@ func (ks *KubeService) purgeDestination(ep *endpointInfo) (err error) {
 func (ks *KubeService) softPurgeDestination(ep *endpointInfo) (err error) {
 	ep.Weight = 0
 	if err = ks.ln.ipvsUpdateDestination(ks.Service, ks.getDestination(ep)); err == nil {
-		glog.V(1).Infof("Successfully deconfigured destination %s from service %s", ep, ks)
+		glog.V(1).Infof("Successfully deconfigured destination %s from service %s", ep.String(1), ks)
 	} else {
-		glog.Errorf("Error deconfiguring destination %s from service %s", ep, ks)
+		glog.Errorf("Error deconfiguring destination %s from service %s", ep.String(), ks)
 	}
 	return
 }

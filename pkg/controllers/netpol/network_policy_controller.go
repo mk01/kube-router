@@ -1016,7 +1016,7 @@ func (npc *NetworkPolicyController) ListPodInfoByNamespaceAndLabels(namespace st
 		}
 
 		matchingPods.podsProtocols[hostnet.NewIP(namespacePod.Status.PodIP).Protocol()] = true
-		if !matchingPods.hasPodsLocally && npc.GetNodeIP().IP.Equal(hostnet.NewIP(namespacePod.Status.HostIP).ToIP()) {
+		if !matchingPods.hasPodsLocally && npc.GetConfig().GetNodeIP().IP.Equal(hostnet.NewIP(namespacePod.Status.HostIP).ToIP()) {
 			matchingPods.hasPodsLocally = true
 		}
 		podInfo.AppendIPs(hostnet.NewIPNetList(npc.getExternalIP(labels.Set(namespacePod.Labels), namespace))...)
@@ -1221,7 +1221,7 @@ func (npc *NetworkPolicyController) newNetworkPolicyEventHandler() cache.Resourc
 
 func (npc *NetworkPolicyController) syncNodesIPSet() (err error) {
 	currentNodes := make([]string, 0)
-	for _, node := range api.GetAllClusterNodes(npc.nodeLister) {
+	for _, node := range api.GetAllClusterNodes(npc.GetConfig().ClientSet) {
 		nodeIP := api.GetNodeIP(&node)
 		currentNodes = append(currentNodes, nodeIP.String())
 	}
@@ -1294,7 +1294,7 @@ func NewNetworkPolicyController(config *options.KubeRouterConfig,
 		npc.v1NetworkPolicy = false
 	}
 
-	npc.Ipm = hostnet.NewIpTablesManager(npc.GetNodeIP().IP)
+	npc.Ipm = hostnet.NewIpTablesManager(npc.GetConfig().GetNodeIP().IP)
 
 	npc.ipSetHandler = hostnet.NewIPSet()
 	npc.ipSetHandler.Save()

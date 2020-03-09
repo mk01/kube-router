@@ -1378,7 +1378,7 @@ func (nsc *NetworkServicesController) buildEndpointsInfoFrom(serviceMap serviceI
 
 			for _, addr := range epSubset.Addresses {
 
-				epLocal := addr.NodeName != nil && *addr.NodeName == nsc.GetNodeName()
+				epLocal := addr.NodeName != nil && *addr.NodeName == nsc.GetConfig().GetNodeName()
 
 				if so.info.Local && !epLocal { //&& so.info.HealthCheckPort == 0 {
 					continue

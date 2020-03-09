@@ -125,9 +125,9 @@ func removeUnusedOverlayTunnels(nrc *NetworkRoutingController) (err error) {
 func checkTunnelLocalAddress(nrc *NetworkRoutingController, link interface{}) bool {
 	switch linkTyped := link.(type) {
 	case *netlink.Iptun:
-		return linkTyped.Local.Equal(nrc.GetNodeIP().IP)
+		return linkTyped.Local.Equal(nrc.GetConfig().GetNodeIP().IP)
 	case *netlink.Ip6tnl:
-		return linkTyped.Local.Equal(nrc.GetNodeIP().IP) && linkTyped.Proto == 41
+		return linkTyped.Local.Equal(nrc.GetConfig().GetNodeIP().IP) && linkTyped.Proto == 41
 	}
 	return false
 }
@@ -201,7 +201,7 @@ func (nrc *NetworkRoutingController) buildRouteForDst(dst *net.IPNet, isSimple b
 	route := &netlink.Route{
 		Dst:      dst,
 		Protocol: 0x11,
-		Src:      nrc.GetNodeIP().IP,
+		Src:      nrc.GetConfig().GetNodeIP().IP,
 	}
 
 	// create IPIP tunnels only when node is not in same subnet or overlay-type is set to 'full'
@@ -233,16 +233,16 @@ func (nrc *NetworkRoutingController) ensureTunnel(tunnelName string, nexthop net
 
 		tools.Eval(hostnet.DelNetlinkInterface(link))
 
-		switch hostnet.NewIP(nrc.GetNodeIP()).Protocol() {
+		switch hostnet.NewIP(nrc.GetConfig().GetNodeIP()).Protocol() {
 		case hostnet.V4:
-			err = netlink.LinkAdd(&netlink.Iptun{LinkAttrs: la, Local: nrc.GetNodeIP().IP, Remote: nexthop})
+			err = netlink.LinkAdd(&netlink.Iptun{LinkAttrs: la, Local: nrc.GetConfig().GetNodeIP().IP, Remote: nexthop})
 		case hostnet.V6:
-			err = netlink.LinkAdd(&netlink.Ip6tnl{LinkAttrs: la, Proto: 41, Local: nrc.GetNodeIP().IP, Remote: nexthop})
+			err = netlink.LinkAdd(&netlink.Ip6tnl{LinkAttrs: la, Proto: 41, Local: nrc.GetConfig().GetNodeIP().IP, Remote: nexthop})
 		}
 
 		if err != nil {
 			return nil, fmt.Errorf("Route not injected for the route advertised by the node %s "+
-				"Failed to create tunnel interface %s. error: %s, output: %s",
+				"Failed to create tunnel interface %s. error: %s",
 				nexthop.String(), tunnelName, err.Error())
 		}
 

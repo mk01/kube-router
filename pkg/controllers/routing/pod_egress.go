@@ -59,5 +59,5 @@ func (nrc *NetworkRoutingController) setupMangleRules(protocol hostnet.Proto, ac
 
 	nrc.Ipm.CreateRuleChain(protocol, "mangle", CHAIN_POD_EGRESS_RULE, hostnet.IPTABLES_FULL_CHAIN_SYNC_NO_ORDER, true, &rules,
 		hostnet.ReferenceFromType{In: "FORWARD"},
-		hostnet.ReferenceFromType{In: "OUTPUT", Rule: []string{"-o", nrc.GetNodeIF()}})
+		hostnet.ReferenceFromType{In: "OUTPUT", Rule: []string{"-o", nrc.GetConfig().GetNodeIF()}})
 }

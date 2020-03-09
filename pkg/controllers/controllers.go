@@ -36,9 +36,7 @@ type Controller struct {
 
 	prettyName string
 	syncPeriod time.Duration
-	config     *options.KubeRouterConfig
-
-	options.NodeInfoType
+	Config     *options.KubeRouterConfig
 
 	runLoopFn RunLoopFunction
 
@@ -48,14 +46,13 @@ type Controller struct {
 func (cnt *Controller) Init(name string, period time.Duration, config *options.KubeRouterConfig, fn RunLoopFunction) *Controller {
 	cnt.prettyName = name
 	cnt.syncPeriod = period
-	cnt.config = config
-	cnt.NodeInfoType = &config.NodeInfo
+	cnt.Config = config
 	cnt.runLoopFn = fn
 	return cnt
 }
 
 func (cnt *Controller) GetConfig() *options.KubeRouterConfig {
-	return cnt.config
+	return cnt.Config
 }
 
 func (cnt *Controller) GetControllerName() string {

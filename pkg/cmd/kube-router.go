@@ -63,7 +63,9 @@ func NewKubeRouterDefault(config *options.KubeRouterConfig) (*KubeRouter, error)
 	}
 
 	config.ClientSet = clientset
-	config.NodeInfo.InitCommons(config)
+	if err := config.NodeInfo.InitCommons(config); err != nil {
+		glog.Fatal(err.Error())
+	}
 	return &KubeRouter{Config: config}, nil
 }
 

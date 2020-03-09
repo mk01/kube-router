@@ -1,6 +1,8 @@
 package options
 
 import (
+	"github.com/cloudnativelabs/kube-router/pkg/helpers/tools"
+	"github.com/golang/glog"
 	"net"
 	"time"
 
@@ -8,7 +10,6 @@ import (
 
 	"github.com/cloudnativelabs/kube-router/pkg/helpers/api"
 	"github.com/cloudnativelabs/kube-router/pkg/helpers/hostnet"
-	"github.com/golang/glog"
 	"github.com/spf13/pflag"
 	"k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
@@ -84,9 +85,9 @@ type KubeRouterConfig struct {
 }
 
 type NodeInfo struct {
-	nodeIP   *net.IPNet
-	nodeIF   string
-	nodeName string
+	NodeIP   *net.IPNet
+	NodeIF   string
+	NodeName string
 	node     *v1.Node
 
 	NodeInfoType
@@ -205,36 +206,39 @@ func (s *KubeRouterConfig) AddFlags(fs *pflag.FlagSet) {
 		"Disable the source-dest-check attribute for AWS EC2 instances. When this option is false, it must be set some other way.")
 }
 
-func (cc *NodeInfo) InitCommons(config *KubeRouterConfig) {
+func (cc *NodeInfo) InitCommons(config *KubeRouterConfig) error {
 	node, err := api.GetNodeObject(config.ClientSet, config.HostnameOverride)
 	if err != nil {
-		glog.Fatal("Failed getting node object from API server: " + err.Error())
+		return tools.NewError("Failed getting node object from API server: " + err.Error())
 	}
 
 	cc.node = node
-	cc.nodeName = node.Name
+	cc.NodeName = node.Name
 
 	nodeIP := api.GetNodeIP(node)
 	if nodeIP == nil {
-		glog.Fatal("Failed getting IP address from node object:")
+		return tools.NewError("Failed getting IP address from node object:")
 	}
 
-	if cc.nodeIP, cc.nodeIF, err = hostnet.GetIPWithSubnet(nodeIP); err != nil {
-		glog.Fatal("Failed find the subnet of the node IP and interface on" +
+	if cc.NodeIP, cc.NodeIF, err = hostnet.GetIPWithSubnet(nodeIP); err != nil {
+		glog.Warning("Failed find the subnet of the node IP and interface on" +
 			"which its configured: " + err.Error())
+		cc.NodeIP = hostnet.NewIP(nodeIP).ToIPNet()
+		cc.NodeIF = "eth0"
 	}
+	return nil
 }
 
 func (cc *NodeInfo) GetNodeIP() *net.IPNet {
-	return cc.nodeIP
+	return cc.NodeIP
 }
 
 func (cc *NodeInfo) GetNodeIF() string {
-	return cc.nodeIF
+	return cc.NodeIF
 }
 
 func (cc *NodeInfo) GetNodeName() string {
-	return cc.nodeName
+	return cc.NodeName
 }
 
 func (cc *NodeInfo) GetNode() *v1.Node {

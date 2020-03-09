@@ -142,11 +142,19 @@ func parseNodeIP(nodeIP string) (ip net.IP) {
 // 1. NodeInternalIP
 // 2. NodeExternalIP (Only set on cloud providers usually)
 func GetNodeIP(node *apiv1.Node) (address net.IP) {
+	var err error
+	if address, err = GetNodeIPwError(node); err != nil {
+		glog.Error(err.Error())
+	}
+	return address
+}
+
+func GetNodeIPwError(node *apiv1.Node) (address net.IP, err error) {
 	var priorityCurrent = -1
 
 	for _, nodeAddress := range node.Status.Addresses {
 		if nodeAddressTypePriorityMap[nodeAddress.Type] == PriorityMax {
-			return parseNodeIP(nodeAddress.Address)
+			return parseNodeIP(nodeAddress.Address), nil
 		}
 
 		if nodeAddressTypePriorityMap[nodeAddress.Type] < priorityCurrent {
@@ -161,6 +169,6 @@ func GetNodeIP(node *apiv1.Node) (address net.IP) {
 	if address != nil {
 		return
 	}
-	glog.Errorf("No suitable or resolvable address found for node %s", node.Name)
+	err = tools.NewErrorf("No suitable or resolvable address found for node %s", node.Name)
 	return
 }

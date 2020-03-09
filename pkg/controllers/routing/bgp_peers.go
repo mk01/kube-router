@@ -41,7 +41,7 @@ func (nrc *NetworkRoutingController) syncInternalPeers() {
 		glog.V(2).Infof("Syncing BGP peers for the node took %v", endTime)
 	}()
 
-	nodes := api.GetAllClusterNodes(nrc.nodeLister)
+	nodes := api.GetAllClusterNodes(nrc.GetConfig().ClientSet)
 	if nrc.MetricsEnabled {
 		metrics.ControllerBPGpeers.Set(float64(len(nodes)))
 	}
@@ -61,8 +61,8 @@ func (nrc *NetworkRoutingController) syncInternalPeers() {
 		// or send signal to quit (and restart) if the node changed IP
 		if nodeIP.Equal(nrc.GetConfig().GetNodeIP().IP) {
 			continue
-		} else if node.Name == nrc.GetNodeName() {
-			glog.Errorf("Node changed it's IP address (%s -> %s), signalling parent to restart", nrc.GetNodeIP(), nodeIP)
+		} else if node.Name == nrc.GetConfig().GetNodeName() {
+			glog.Errorf("Node changed it's IP address (%s -> %s), signalling parent to restart", nrc.GetConfig().GetNodeIP(), nodeIP)
 			process, _ := os.FindProcess(nrc.GetConfig().KubeRouterPid)
 			process.Signal(syscall.SIGINT)
 			return

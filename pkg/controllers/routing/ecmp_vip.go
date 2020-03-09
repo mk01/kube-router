@@ -18,7 +18,7 @@ import (
 // bgpAdvertiseVIP advertises the service vip (cluster ip or load balancer ip or external IP) the configured peers
 func (nrc *NetworkRoutingController) bgpAdvertiseVIP(vip string) error {
 	ip := hostnet.NewIP(vip)
-	node := hostnet.NewIP(nrc.GetNodeIP())
+	node := hostnet.NewIP(nrc.GetConfig().GetNodeIP())
 
 	glog.V(2).Infof("Advertising route: '%s via %s' to peers", ip.ToCIDR(), node.ToIP().String())
 	_, err := nrc.bgpServer.AddPath("", []*table.Path{table.NewPath(nil, ip.ToBgpPrefix(), false, getPathAttributes(ip, node), time.Now(), false)})
@@ -29,7 +29,7 @@ func (nrc *NetworkRoutingController) bgpAdvertiseVIP(vip string) error {
 // bgpWithdrawVIP  unadvertises the service vip
 func (nrc *NetworkRoutingController) bgpWithdrawVIP(vip string) error {
 	ip := hostnet.NewIP(vip)
-	node := hostnet.NewIP(nrc.GetNodeIP())
+	node := hostnet.NewIP(nrc.GetConfig().GetNodeIP())
 
 	glog.V(2).Infof("Withdrawing route: '%s via %s' to peers", ip.ToCIDR(), node.ToIP().String())
 	err := nrc.bgpServer.DeletePath([]byte(nil), 0, "", []*table.Path{table.NewPath(nil, ip.ToBgpPrefix(), true, getPathAttributes(ip, node), time.Now(), false)})
@@ -381,7 +381,7 @@ func (nrc *NetworkRoutingController) nodeHasEndpointsForService(svc *v1core.Serv
 
 	for _, subset := range ep.Subsets {
 		for _, address := range subset.Addresses {
-			if *address.NodeName == nrc.GetNodeName() {
+			if address.NodeName != nil && *address.NodeName == nrc.GetConfig().GetNodeName() {
 				return true, nil
 			}
 		}

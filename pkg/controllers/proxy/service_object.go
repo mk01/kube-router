@@ -219,7 +219,7 @@ func (so *serviceObject) linkService(old *kubeServiceArrayType, ip *net.IPNet, i
 	}
 
 	if err = ksvc.deploy(create || so.meta.change.CheckFor(SynchNew)); err != nil {
-		glog.Errorf("Create: %v, failed %s, Object: %v\nService Object:", err.Error(), so, old)
+		glog.Errorf("Create: %v, failed %s, Object: %v\nService Object:", err.Error(), so.String(), old)
 		return
 	}
 
