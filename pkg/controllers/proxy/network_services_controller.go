@@ -235,7 +235,7 @@ func (ln *linuxNetworking) ipvsGetDestinations(ipvsSvc *libipvs.Service, force b
 }
 
 func (ln *linuxNetworking) ipvsRefreshDestinations(ipvsSvc *libipvs.Service) *ipvsDestinationArrayType {
-	list, err := ln.ipvsHandle.ListDestinations(ipvsSvc)
+	list, err := ln.ipvsHandle.ListDestinationsBasic(ipvsSvc)
 	if err != nil {
 		glog.Errorf("Error refreshing ipvsGetDestinations: %s", err.Error())
 	}

@@ -16,10 +16,12 @@ type IPVSHandle interface {
 	Flush() error
 	GetInfo() (info Info, err error)
 	ListServices() (services []*Service, err error)
+	ListServicesBasic() (services []*Service, err error)
 	NewService(s *Service) error
 	UpdateService(s *Service) error
 	DelService(s *Service) error
 	ListDestinations(s *Service) (dsts []*Destination, err error)
+	ListDestinationsBasic(s *Service) (dsts []*Destination, err error)
 	NewDestination(s *Service, d *Destination) error
 	UpdateDestination(s *Service, d *Destination) error
 	DelDestination(s *Service, d *Destination) error
@@ -88,12 +90,20 @@ func (i *Handle) Flush() error {
 }
 
 func (i *Handle) ListServices() (services []*Service, err error) {
+	return i.listServices(true)
+}
+
+func (i *Handle) ListServicesBasic() (services []*Service, err error) {
+	return i.listServices(false)
+}
+
+func (i *Handle) listServices(stats bool) (services []*Service, err error) {
 	respHandler := &ResponseHandler{
 		Policy: ipvs_cmd_policy,
 		Handle: func(attrs nlgo.AttrMap) error {
 			if serviceAttrs := attrs.Get(IPVS_CMD_ATTR_SERVICE); serviceAttrs == nil {
 				return fmt.Errorf("IPVS_CMD_GET_SERVICE without IPVS_CMD_ATTR_SERVICE")
-			} else if service, err := unpackService(serviceAttrs.(nlgo.AttrMap)); err != nil {
+			} else if service, err := unpackService(serviceAttrs.(nlgo.AttrMap), stats); err != nil {
 				return err
 			} else {
 				services = append(services, &service)
@@ -105,12 +115,20 @@ func (i *Handle) ListServices() (services []*Service, err error) {
 }
 
 func (i *Handle) ListDestinations(s *Service) (dsts []*Destination, err error) {
+	return i.listDestinations(s, true)
+}
+
+func (i *Handle) ListDestinationsBasic(s *Service) (dsts []*Destination, err error) {
+	return i.listDestinations(s, false)
+}
+
+func (i *Handle) listDestinations(s *Service, stats bool) (dsts []*Destination, err error) {
 	respHandler := &ResponseHandler{
 		Policy: ipvs_cmd_policy,
 		Handle: func(attrs nlgo.AttrMap) error {
 			if destAttrs := attrs.Get(IPVS_CMD_ATTR_DEST); destAttrs == nil {
 				return fmt.Errorf("IPVS_CMD_GET_DEST without IPVS_CMD_ATTR_DEST")
-			} else if dst, err := unpackDest(destAttrs.(nlgo.AttrMap), s.AddressFamily); err != nil {
+			} else if dst, err := unpackDest(destAttrs.(nlgo.AttrMap), s.AddressFamily, stats); err != nil {
 				return err
 			} else {
 				dsts = append(dsts, &dst)

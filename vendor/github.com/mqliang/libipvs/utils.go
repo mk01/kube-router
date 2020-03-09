@@ -90,7 +90,7 @@ func packPort(port uint16) nlgo.U16 {
 	return nlgo.U16(htons(port))
 }
 
-func unpackService(attrs nlgo.AttrMap) (Service, error) {
+func unpackService(attrs nlgo.AttrMap, stats bool) (Service, error) {
 	var service Service
 
 	var addr nlgo.Binary
@@ -117,7 +117,9 @@ func unpackService(attrs nlgo.AttrMap) (Service, error) {
 		case IPVS_SVC_ATTR_NETMASK:
 			service.Netmask = (uint32)(attr.Value.(nlgo.U32))
 		case IPVS_SVC_ATTR_STATS:
-			service.Stats = unpackStats(attr)
+			if stats {
+				service.Stats = unpackStats(attr)
+			}
 		}
 	}
 
@@ -135,7 +137,7 @@ func unpackService(attrs nlgo.AttrMap) (Service, error) {
 	return service, nil
 }
 
-func unpackDest(attrs nlgo.AttrMap, serverAddressFamily AddressFamily) (Destination, error) {
+func unpackDest(attrs nlgo.AttrMap, serverAddressFamily AddressFamily, stats bool) (Destination, error) {
 	var dest Destination
 	var addr []byte
 
@@ -162,7 +164,9 @@ func unpackDest(attrs nlgo.AttrMap, serverAddressFamily AddressFamily) (Destinat
 		case IPVS_DEST_ATTR_PERSIST_CONNS:
 			dest.PersistConns = (uint32)(attr.Value.(nlgo.U32))
 		case IPVS_DEST_ATTR_STATS:
-			dest.Stats = unpackStats(attr)
+			if stats {
+				dest.Stats = unpackStats(attr)
+			}
 		}
 	}
 	// Linux kernel prior v3.18-rc1 does not have the af (address family) field
