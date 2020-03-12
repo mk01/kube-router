@@ -124,7 +124,7 @@ func (nrc *NetworkRoutingController) run(stopCh <-chan struct{}) (err error) {
 
 	// In case of cluster provisioned on AWS disable source-destination check
 	if nrc.disableSrcDstCheck {
-		nrc.disableSourceDestinationCheck()
+		nrc.disableSourceDestinationCheck(api.GetAllClusterNodes(nrc.nodeLister))
 		nrc.initSrcDstCheckDone = true
 	}
 
@@ -452,7 +452,7 @@ func (nrc *NetworkRoutingController) syncNodeIPSets() error {
 		glog.V(2).Infof("Sync nodeIpSets in network routing controller took %v", time.Since(start))
 	}()
 	// Get the current list of the nodes from API server
-	nodes := api.GetAllClusterNodes(nrc.GetConfig().ClientSet)
+	nodes := api.GetAllClusterNodes(nrc.nodeLister)
 
 	// Collect active PodCIDR(s) and NodeIPs from nodes
 	currentPodCidrs := make([]string, 0)
@@ -469,7 +469,7 @@ func (nrc *NetworkRoutingController) syncNodeIPSets() error {
 			currentPodCidrs = append(currentPodCidrs, podCIDR)
 		}
 
-		nodeIP := api.GetNodeIP(&node)
+		nodeIP := api.GetNodeIP(node)
 		if nodeIP == nil {
 			return tools.NewError("Failed to find a node IP")
 		}
@@ -479,10 +479,13 @@ func (nrc *NetworkRoutingController) syncNodeIPSets() error {
 	// Syncing Pod subnet ipset entries
 	psSet, err := nrc.ipSetHandler.GetOrCreate(podSubnetsIPSetName)
 	if err != nil {
-		return fmt.Errorf("ipset \"%s\" not found in controller instance",
-			podSubnetsIPSetName)
+		return fmt.Errorf("ipset \"%s\" not found in controller instance", podSubnetsIPSetName)
 	}
 	psSet.RefreshAsync(currentPodCidrs, psSet.Options...)
+
+	if nrc.GetConfig().RunFirewall {
+		return nil
+	}
 
 	// Syncing Node Addresses ipset entries
 	naSet, err := nrc.ipSetHandler.GetOrCreate(nodeAddrsIPSetName)

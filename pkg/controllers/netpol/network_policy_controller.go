@@ -36,7 +36,7 @@ type kubePolPrefixType string
 
 const (
 	networkPolicyAnnotation                        = "net.beta.kubernetes.io/network-policy"
-	kubeNodesIpSet                                 = "KUBE-NPC-NODESIP-LIST"
+	kubeNodesIpSet                                 = "kube-router-node-ips"
 	kubeForwardRejectIpSet                         = "KUBE-NPC-REJECT-LIST"
 	kubePodInChainPrefix         kubePolPrefixType = "KUBE-PODIN-"
 	kubePodOutChainPrefix        kubePolPrefixType = "KUBE-PODOUT-"
@@ -1221,8 +1221,8 @@ func (npc *NetworkPolicyController) newNetworkPolicyEventHandler() cache.Resourc
 
 func (npc *NetworkPolicyController) syncNodesIPSet() (err error) {
 	currentNodes := make([]string, 0)
-	for _, node := range api.GetAllClusterNodes(npc.GetConfig().ClientSet) {
-		nodeIP := api.GetNodeIP(&node)
+	for _, node := range api.GetAllClusterNodes(npc.nodeLister) {
+		nodeIP := api.GetNodeIP(node)
 		currentNodes = append(currentNodes, nodeIP.String())
 	}
 
@@ -1318,5 +1318,6 @@ func NewNetworkPolicyController(config *options.KubeRouterConfig,
 	npc.NodesEventHandler = npc.newNodesEventHandler()
 	nodeInformer.AddEventHandler(npc.NodesEventHandler)
 
+	npc.syncNodesIPSet()
 	return &npc
 }
