@@ -41,7 +41,7 @@ func (nrc *NetworkRoutingController) syncInternalPeers() {
 		glog.V(2).Infof("Syncing BGP peers for the node took %v", endTime)
 	}()
 
-	nodes := api.GetAllClusterNodes(nrc.GetConfig().ClientSet)
+	nodes := api.GetAllClusterNodes(nrc.nodeLister)
 	if nrc.MetricsEnabled {
 		metrics.ControllerBPGpeers.Set(float64(len(nodes)))
 	}
